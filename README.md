@@ -29,22 +29,22 @@ A comprehensive, distro-agnostic installation script for ISPConfig hosting contr
 
 ### Option 1: One-liner (Quick Start)
 ```bash
-curl -sSL https://raw.githubusercontent.com/scriptmgr/ispconfig/main/ispconfig_universal_installer.sh | bash
+curl -sSL https://raw.githubusercontent.com/scriptmgr/ispconfig/main/install.sh | bash
 ```
 
 ### Option 2: Download and Review (Recommended)
 ```bash
-wget https://raw.githubusercontent.com/scriptmgr/ispconfig/main/ispconfig_universal_installer.sh
-chmod +x ispconfig_universal_installer.sh
-./ispconfig_universal_installer.sh
+wget https://raw.githubusercontent.com/scriptmgr/ispconfig/main/install.sh
+chmod +x install.sh
+./install.sh
 ```
 
 ### Option 3: Git Clone
 ```bash
 git clone https://github.com/scriptmgr/ispconfig.git
 cd ispconfig
-chmod +x ispconfig_universal_installer.sh
-./ispconfig_universal_installer.sh
+chmod +x install.sh
+./install.sh
 ```
 
 ## ⚙️ What Gets Installed
