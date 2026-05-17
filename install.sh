@@ -728,14 +728,22 @@ __install_mail() {
                 || warn "opendkim not available — DKIM will be skipped"
             ;;
         "dnf"|"yum")
+            # CRB (CodeReady Builder / powertools) is required for sendmail-milter
+            # and libmemcached-awesome which are opendkim dependencies on el8/el9.
+            dnf config-manager --set-enabled crb 2>/dev/null \
+                || dnf config-manager --set-enabled powertools 2>/dev/null \
+                || true
             # Required
             $PACKAGE_MANAGER install -y \
                 postfix postfix-mysql postfix-pcre \
                 dovecot dovecot-mysql dovecot-pigeonhole \
                 cyrus-sasl cyrus-sasl-plain cyrus-sasl-md5
-            # opendkim on RHEL needs libmilter (sendmail) and libmemcached
-            $PACKAGE_MANAGER install -y sendmail-milter libmemcached 2>/dev/null || true
-            $PACKAGE_MANAGER install -y opendkim \
+            # opendkim on RHEL needs libmilter (sendmail-milter, CRB) and
+            # libmemcached-awesome (CRB); package name changed from libmemcached in el9
+            $PACKAGE_MANAGER install -y sendmail-milter 2>/dev/null || true
+            $PACKAGE_MANAGER install -y libmemcached-awesome 2>/dev/null \
+                || $PACKAGE_MANAGER install -y libmemcached 2>/dev/null || true
+            $PACKAGE_MANAGER install -y opendkim opendkim-tools \
                 || warn "opendkim not available — DKIM will be skipped"
             ;;
         "zypper")
@@ -911,10 +919,13 @@ __install_ftp() {
             # proftpd on EPEL 9 depends on libmemcached which is in CRB (CodeReady Builder).
             # Enable CRB first, install the dep, then try proftpd normally;
             # fall back to --nobest if strict dep resolution fails.
+            # CRB already enabled by __install_mail; re-enable idempotently in case
+            # install order changes.
             dnf config-manager --set-enabled crb 2>/dev/null \
                 || dnf config-manager --set-enabled powertools 2>/dev/null \
                 || true
-            $PACKAGE_MANAGER install -y libmemcached 2>/dev/null || true
+            $PACKAGE_MANAGER install -y libmemcached-awesome 2>/dev/null \
+                || $PACKAGE_MANAGER install -y libmemcached 2>/dev/null || true
             $PACKAGE_MANAGER install -y proftpd proftpd-mysql \
                 || $PACKAGE_MANAGER install -y --nobest proftpd proftpd-mysql \
                 || warn "proftpd install failed — FTP may not be available"
@@ -956,6 +967,8 @@ __install_tools() {
             ;;
         "dnf"|"yum")
             $PACKAGE_MANAGER install -y bind bind-utils rsync crontabs
+            # RHEL named.conf includes named.conf.local which must exist before start
+            touch /etc/named.conf.local
             __try_install "$PACKAGE_MANAGER" quota certbot
             __try_install "$PACKAGE_MANAGER" awstats webalizer clamav clamav-update amavisd-new spamassassin
             ;;
