@@ -1,274 +1,243 @@
 # Universal ISPConfig Installation Script
 
-A comprehensive, distro-agnostic installation script for ISPConfig hosting control panel that supports multiple Linux distributions and PHP versions out of the box.
+A comprehensive, distro-agnostic installation script for ISPConfig hosting control panel. Installs a full LEMP/LAMP stack with Nginx as the SSL-terminating reverse proxy in front of Apache, multiple co-installable PHP versions, and a complete mail stack — fully automated with zero interactive prompts.
 
-## 🌟 Features
+## ✨ Features
 
-- **🌍 Universal Compatibility** - Works across all ISPConfig-supported Linux distributions
-- **🐘 Multiple PHP Versions** - Installs PHP 5.6 through 8.3 with full extension support
-- **🔧 Automated Configuration** - Complete LAMP/LEMP stack setup with optimal settings
-- **🛡️ Security First** - Automatic firewall configuration and SSL certificate generation
-- **📊 Smart Detection** - Automatically detects distribution and adapts installation accordingly
-- **⚡ Production Ready** - Configured for hosting environments with proper service management
+- **🌍 Universal compatibility** — works across all major Linux distributions
+- **🐘 Multiple PHP versions** — installs PHP 5.6 through 8.4 with full extension support
+- **🔀 Nginx + Apache architecture** — Nginx handles SSL termination and static assets; Apache runs PHP on a loopback backend port
+- **🔧 Fully automated** — no interactive prompts; generates all passwords at runtime
+- **🛡️ Security first** — firewall rules, TLS 1.2/1.3 only, HSTS, DH params, OCSP stapling
+- **📧 Production mail stack** — Postfix + Dovecot + OpenDKIM with submission and SMTPS ports
+- **⚡ Production ready** — Event MPM, RemoteIP passthrough, PHP-FPM pools, logrotate
 
 ## 📋 Supported Distributions
 
-| Distribution | Versions | Package Manager | Status |
-|--------------|----------|-----------------|--------|
-| **Ubuntu** | 18.04, 20.04, 22.04, 24.04 | apt | ✅ Fully Supported |
-| **Debian** | 9, 10, 11, 12 | apt | ✅ Fully Supported |
-| **CentOS** | 7, 8, 9 | yum/dnf | ✅ Fully Supported |
-| **RHEL** | 7, 8, 9 | yum/dnf | ✅ Fully Supported |
-| **AlmaLinux** | 8, 9, 10 | dnf | ✅ Fully Supported |
-| **Rocky Linux** | 8, 9, 10 | dnf | ✅ Fully Supported |
-| **Fedora** | 36-49 | dnf | ✅ Fully Supported |
-| **openSUSE Leap** | 15.x | zypper | ✅ Fully Supported |
-| **SLES** | 15.x | zypper | ✅ Fully Supported |
+| Distribution | Versions | Package Manager |
+|---|---|---|
+| **Ubuntu** | 18.04, 20.04, 22.04, 24.04 | apt |
+| **Debian** | 9, 10, 11, 12, 13 | apt |
+| **CentOS / RHEL** | 7, 8, 9 | yum / dnf |
+| **AlmaLinux** | 8, 9, 10 | dnf |
+| **Rocky Linux** | 8, 9, 10 | dnf |
+| **Fedora** | 36–49 | dnf |
+| **openSUSE Leap / SLES** | 15.x | zypper |
 
-## 🚀 Quick Installation
+## 🚀 Quick Start
 
-### Option 1: One-liner (Quick Start)
 ```bash
-curl -sSL https://raw.githubusercontent.com/scriptmgr/ispconfig/main/install.sh | bash
-```
-
-### Option 2: Download and Review (Recommended)
-```bash
+# Download and review first (recommended)
 wget https://raw.githubusercontent.com/scriptmgr/ispconfig/main/install.sh
 chmod +x install.sh
-./install.sh
+bash install.sh
 ```
 
-### Option 3: Git Clone
-```bash
-git clone https://github.com/scriptmgr/ispconfig.git
-cd ispconfig
-chmod +x install.sh
-./install.sh
+The script must be run as root. It detects your distribution automatically and requires no configuration.
+
+## 🏗️ Architecture
+
 ```
+Internet
+   │
+   ▼
+Nginx :80        → redirect to HTTPS
+Nginx :443       → TLS termination → Apache 127.0.0.1:81  (websites)
+Nginx :64245     → TLS termination → Apache 127.0.0.1:7080 (ISPConfig panel)
+```
+
+Apache listens only on loopback. All TLS, HSTS, and caching are handled by Nginx. PHP runs via FPM pools. ISPConfig manages Apache vhost templates and DNS; Nginx picks up Let's Encrypt certificates automatically via a deploy hook.
 
 ## ⚙️ What Gets Installed
 
-### Core Components
-- **Web Server**: Apache with SSL and mod_rewrite
-- **Database**: MariaDB with secure configuration
-- **Mail Server**: Postfix + Dovecot with MySQL integration
-- **FTP Server**: Pure-FTPd with MySQL authentication
-- **DNS Server**: BIND9/named
-- **Control Panel**: ISPConfig 3 (latest stable)
+| Component | Software |
+|---|---|
+| Frontend proxy | Nginx (Event, SSL, gzip, open-file-cache) |
+| Web backend | Apache (Event MPM, mod-fcgid, RemoteIP) |
+| Database | MariaDB (secured, root password in `/root/.my.cnf`) |
+| PHP | 5.6, 7.0, 7.1, 7.2, 7.3, 7.4, 8.0, 8.1, 8.2, 8.3, 8.4 with FPM |
+| Mail | Postfix + Dovecot + OpenDKIM (ports 25, 465, 587, 143, 993, 110, 995) |
+| FTP | ProFTPd with MySQL authentication |
+| DNS | BIND9 / named |
+| Control panel | ISPConfig 3 (latest stable) |
+| Anti-spam | SpamAssassin + Amavisd-new |
+| Antivirus | ClamAV |
+| Stats | Awstats, Webalizer |
+| SSL | Self-signed certs at install; Let's Encrypt via certbot + auto-sync hook |
 
-### PHP Versions
-- PHP 5.6, 7.0, 7.1, 7.2, 7.3, 7.4, 8.0, 8.1, 8.2, 8.3
-- All versions include common extensions: mysql, gd, mbstring, xml, curl, zip, soap, intl, bcmath, opcache
-- Individual PHP-FPM pools for each version
-- ISPConfig integration with version selection per website
-
-### Security & Monitoring
-- Automatic firewall configuration (UFW/firewalld)
-- SSL certificates for ISPConfig admin panel
-- ClamAV antivirus
-- SpamAssassin anti-spam
-- Fail2ban (planned for future release)
-
-### Additional Tools
-- Awstats and Webalizer for statistics
-- Rsync for backups
-- Quota management
-- Cron job management
-
-## 🔧 Configuration
-
-### Default Settings
-- **ISPConfig Admin Port**: 64245 (customizable in script)
-- **Web Root**: `/var/www/html` (or `/srv/www/htdocs` on openSUSE)
-- **PHP Default Version**: 8.1
-- **Database**: MariaDB with auto-generated secure passwords
-- **SSL**: Self-signed certificates (recommend Let's Encrypt for production)
-
-### Custom Configuration
-You can modify the script variables at the top of the file:
-```bash
-ADMIN_PORT=64245                    # ISPConfig admin port
-PHP_VERSIONS=("5.6" "7.0" ... "8.3")  # PHP versions to install
-```
+PHP extensions installed per version: `mysql`, `pgsql`, `sqlite3`, `gd`, `imagick`, `mbstring`, `xml`, `curl`, `zip`, `soap`, `intl`, `bcmath`, `opcache`, `readline`, `bz2`, `xsl`, `tidy`, `ldap`, `imap`, `gettext`, `exif`, `sockets`, `redis`, `memcached`.
 
 ## 📖 Post-Installation
 
-### Access ISPConfig
-1. Open your browser and navigate to: `https://your-server-ip:64245`
-2. Login with:
-   - **Username**: `admin`
-   - **Password**: Check `/root/ispconfig_installation_summary.txt`
+### Access the panel
 
-### Test PHP Versions
-Visit `http://your-server-ip/phpinfo.php` to see all installed PHP versions.
-
-### First Steps
-1. **Change default passwords** in ISPConfig admin panel
-2. **Configure your first website** and select desired PHP version
-3. **Set up email accounts** and test mail functionality
-4. **Configure DNS** if using ISPConfig's DNS management
-5. **Set up SSL certificates** (Let's Encrypt recommended for production)
-
-## 📁 Important Files & Locations
-
-### Configuration Files
 ```
-/usr/local/ispconfig/                    # ISPConfig installation
-/root/ispconfig_installation_summary.txt # Installation summary & passwords
-/root/.my.cnf                           # MySQL root credentials
+https://<server-ip>:64245
+Username: admin
+Password: see /root/ispconfig_installation_summary.txt
 ```
 
-### Service Management
+### Summary file
+
+All generated credentials, architecture details, port mapping, and next steps are written to:
+
+```
+/root/ispconfig_installation_summary.txt
+```
+
+### Let's Encrypt workflow
+
 ```bash
-# Restart services
-systemctl restart apache2      # Ubuntu/Debian
-systemctl restart httpd        # RHEL-based
+# Issue a cert (ACME webroot is pre-configured at /var/www/letsencrypt)
+certbot certonly --webroot -w /var/www/letsencrypt -d example.com -d www.example.com
+
+# Sync cert to Nginx vhosts (runs automatically on renewal via deploy hook)
+/usr/local/bin/ispconfig-nginx-sync
+```
+
+### Test PHP versions
+
+Visit `http://<server-ip>/phpinfo.php` — lists all installed PHP versions and confirms `X-Forwarded-Proto` passthrough. **Remove before going live.**
+
+## 📁 Key Paths
+
+| Path | Purpose |
+|---|---|
+| `/usr/local/ispconfig/` | ISPConfig root |
+| `/root/ispconfig_installation_summary.txt` | Credentials and next steps |
+| `/root/.my.cnf` | MariaDB root credentials |
+| `/etc/nginx/nginx.conf` | Nginx main config |
+| `/etc/nginx/vhosts.d/` | Nginx virtual host drop-ins |
+| `/etc/postfix/main.cf` | Postfix config |
+| `/etc/dovecot/conf.d/` | Dovecot config |
+| `/etc/opendkim.conf` | OpenDKIM config |
+| `/usr/local/bin/ispconfig-nginx-sync` | Cert sync helper |
+
+### Add a custom Nginx vhost
+
+```bash
+# Drop a .conf file and reload — no ISPConfig involvement needed
+cat > /etc/nginx/vhosts.d/myapp.conf << 'EOF'
+server {
+    listen 443 ssl;
+    server_name myapp.example.com;
+    ssl_certificate     /etc/letsencrypt/live/myapp.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/myapp.example.com/privkey.pem;
+    location / { proxy_pass http://127.0.0.1:3000; }
+}
+EOF
+nginx -t && systemctl reload nginx
+```
+
+## 🛡️ DKIM / SPF / DMARC
+
+OpenDKIM is installed and wired into Postfix. Keys are generated per-domain through the ISPConfig UI (DNS → Zones → DKIM).
+
+After generating a key, add these DNS records:
+
+```
+# DKIM
+mail._domainkey.example.com  TXT  "v=DKIM1; k=rsa; p=<key from ISPConfig>"
+
+# SPF
+example.com  TXT  "v=spf1 a mx ip4:<server-ip> ~all"
+
+# DMARC
+_dmarc.example.com  TXT  "v=DMARC1; p=quarantine; rua=mailto:admin@example.com"
+```
+
+Also set a **PTR record** (reverse DNS) for your server IP → `<hostname>` with your VPS provider.
+
+## 🔧 Service Management
+
+```bash
+# Nginx
+systemctl reload nginx          # reload config without dropping connections
+systemctl restart nginx
+
+# Apache (Debian/Ubuntu)
+systemctl restart apache2
+
+# Apache (RHEL-family)
+systemctl restart httpd
+
+# PHP-FPM (Debian/Ubuntu — replace 8.4 with any installed version)
+systemctl restart php8.4-fpm
+
+# PHP-FPM (RHEL-family)
+systemctl restart php84-php-fpm
+
+# Mail
+systemctl restart postfix dovecot opendkim
+
+# FTP
+systemctl restart proftpd
+
+# MariaDB
 systemctl restart mariadb
-systemctl restart postfix
-systemctl restart dovecot
-systemctl restart pure-ftpd
-
-# PHP-FPM services
-systemctl restart php8.1-fpm   # Ubuntu/Debian
-systemctl restart php81-php-fpm # RHEL-based
-```
-
-### Log Files
-```
-/var/log/ispconfig/             # ISPConfig logs
-/var/log/apache2/               # Web server logs (Ubuntu/Debian)
-/var/log/httpd/                 # Web server logs (RHEL-based)
-/var/log/mail.log               # Mail server logs
 ```
 
 ## 🐛 Troubleshooting
 
-### Common Issues
-
-**1. Installation fails on unsupported distribution**
+**Cannot reach the ISPConfig panel**
 ```bash
-# Check if your distribution is supported
-cat /etc/os-release
+ufw status                        # Debian/Ubuntu
+firewall-cmd --list-ports         # RHEL-family
+systemctl status nginx apache2    # check both are running
 ```
 
-**2. Cannot access ISPConfig admin panel**
+**PHP version missing in ISPConfig**
 ```bash
-# Check if firewall allows the admin port
-firewall-cmd --list-ports                    # RHEL-based
-ufw status                                    # Ubuntu/Debian
-
-# Check if ISPConfig is running
-systemctl status ispconfig_server
+ls /usr/bin/php*                    # Debian/Ubuntu installed versions
+ls /opt/remi/php*/root/usr/bin/php  # RHEL-family
+systemctl status 'php*-fpm'
 ```
 
-**3. PHP version not available in ISPConfig**
+**Mail not delivering**
 ```bash
-# Verify PHP versions are installed
-ls /usr/local/bin/php*
-
-# Check PHP-FPM services
-systemctl status php*-fpm
-```
-
-**4. Email not working**
-```bash
-# Check mail services
-systemctl status postfix dovecot
-
-# Check mail logs
+systemctl status postfix dovecot opendkim
 tail -f /var/log/mail.log
+postconf smtpd_milters              # verify OpenDKIM is wired in
 ```
 
-### Getting Help
-
-1. **Check the installation summary**: `/root/ispconfig_installation_summary.txt`
-2. **Review ISPConfig logs**: `/var/log/ispconfig/`
-3. **Open an issue**: [GitHub Issues](https://github.com/scriptmgr/ispconfig/issues)
-4. **ISPConfig Documentation**: [https://www.ispconfig.org/documentation/](https://www.ispconfig.org/documentation/)
-
-## 🤝 Contributing
-
-We welcome contributions! Here's how you can help:
-
-### Reporting Issues
-- Use the [GitHub Issues](https://github.com/scriptmgr/ispconfig/issues) page
-- Include your distribution name and version
-- Provide relevant log excerpts
-- Describe the expected vs actual behavior
-
-### Contributing Code
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/new-feature`
-3. Make your changes and test on multiple distributions
-4. Commit with clear messages: `git commit -m "Add support for XYZ"`
-5. Push to your fork: `git push origin feature/new-feature`
-6. Create a Pull Request
-
-### Testing
-Help us test on different distributions:
-- Test the script on various Linux distributions
-- Report compatibility issues
-- Suggest improvements for specific distributions
-
-## 📝 Changelog
-
-### v1.0.0
-- Initial release with universal distribution support
-- Multiple PHP versions (5.6-8.3)
-- Automated ISPConfig installation
-- Security hardening and firewall configuration
-
-## ⚠️ Security Considerations
-
-### For Production Use
-1. **Change default passwords** immediately after installation
-2. **Configure proper SSL certificates** (Let's Encrypt recommended)
-3. **Remove or secure test files** like `phpinfo.php`
-4. **Regular security updates**: Keep all packages updated
-5. **Backup strategy**: Implement regular backups of databases and configurations
-6. **Firewall review**: Adjust firewall rules for your specific needs
-
-### Network Security
-- The script opens standard hosting ports (80, 443, 21, 25, 110, 143, etc.)
-- ISPConfig admin panel uses custom port (64245) for security
-- Consider changing SSH port and implementing key-based authentication
-- Use fail2ban for additional intrusion prevention
+**Nginx config test**
+```bash
+nginx -t
+```
 
 ## 📊 System Requirements
 
-### Minimum Requirements
-- **RAM**: 2GB (4GB+ recommended for production)
-- **Storage**: 20GB available space (50GB+ recommended)
-- **Network**: Static IP address recommended
-- **Root Access**: Required for installation
+| | Minimum | Recommended |
+|---|---|---|
+| RAM | 2 GB | 4 GB+ |
+| Disk | 20 GB | 50 GB+ SSD |
+| CPU | 1 core | 2+ cores |
+| Network | Any | Static IP |
 
-### Recommended Specifications
-- **RAM**: 8GB or more for busy hosting environments
-- **Storage**: SSD storage for better performance
-- **CPU**: 2+ cores for multiple websites
-- **Network**: Dedicated server or VPS with good bandwidth
+Root access is required.
 
-## 🔗 Related Projects
+## ⚠️ Security Notes
 
-- **ISPConfig**: [https://www.ispconfig.org/](https://www.ispconfig.org/)
-- **Let's Encrypt**: [https://letsencrypt.org/](https://letsencrypt.org/)
-- **Remi Repository**: [https://rpms.remirepo.net/](https://rpms.remirepo.net/)
-- **Ondřej Surý PHP PPA**: [https://launchpad.net/~ondrej/+archive/ubuntu/php](https://launchpad.net/~ondrej/+archive/ubuntu/php)
+- All passwords are randomly generated at install time and saved to `/root/ispconfig_installation_summary.txt` — secure this file
+- SSL certificates are self-signed at install — replace with Let's Encrypt before serving traffic
+- Remove `/var/www/html/phpinfo.php` before going live
+- Review opened firewall ports and close any not needed for your use case
+- Set a PTR record (reverse DNS) for your IP — required for reliable mail delivery
+
+## 🤝 Contributing
+
+Issues and pull requests are welcome on [GitHub](https://github.com/scriptmgr/ispconfig). When reporting a bug please include:
+
+- Distribution name and version (`cat /etc/os-release`)
+- Relevant lines from the install log
+- Expected vs actual behaviour
 
 ## 📜 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT — see [LICENSE.md](LICENSE.md).
 
 ## 🙏 Acknowledgments
 
-- **ISPConfig Team** for creating an excellent hosting control panel
-- **Remi Collet** for maintaining comprehensive PHP packages for RHEL-based systems
-- **Ondřej Surý** for maintaining PHP packages for Debian/Ubuntu systems
-- **Community contributors** who test and improve this script
-
----
-
-**⭐ If this script helped you, please consider starring the repository!**
-
-For professional hosting management and ISPConfig consulting, visit [ISPConfig.org](https://www.ispconfig.org/).
+- [ISPConfig](https://www.ispconfig.org/) — the hosting control panel this script deploys
+- [Ondřej Surý](https://launchpad.net/~ondrej/+archive/ubuntu/php) — PHP packages for Debian/Ubuntu
+- [Remi Collet](https://rpms.remirepo.net/) — PHP packages for RHEL-family systems

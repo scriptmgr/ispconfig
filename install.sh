@@ -444,9 +444,8 @@ VHOST_EOF
     # ── vhosts.d/00-default-https.conf ───────────────────────────────────────
     cat > "${NGINX_VHOSTS_DIR}/00-default-https.conf" << VHOST_EOF
 server {
-    listen      443 ssl default_server;
-    listen      [::]:443 ssl default_server;
-    http2       on;
+    listen      443 ssl http2 default_server;
+    listen      [::]:443 ssl http2 default_server;
     server_name _;
 
     ssl_certificate     ${SSL_DIR}/default.crt;
@@ -593,7 +592,8 @@ __install_php_debian() {
         log "Installing PHP ${version}..."
 
         # Core packages — required for every version
-        # Note: errors go to log (not suppressed) so failures are visible
+        # Note: php${version}-pcntl is NOT a separate package on Ondrej PPA;
+        # PCNTL is compiled into the PHP CLI binary directly.
         if ! apt-get install -y \
             php${version} php${version}-cli php${version}-fpm php${version}-cgi \
             php${version}-common php${version}-mysql php${version}-pgsql \
@@ -603,7 +603,7 @@ __install_php_debian() {
             php${version}-bcmath php${version}-opcache php${version}-readline \
             php${version}-bz2 php${version}-xsl php${version}-tidy \
             php${version}-ldap php${version}-imap php${version}-gettext \
-            php${version}-exif php${version}-sockets php${version}-pcntl \
+            php${version}-exif php${version}-sockets \
             php${version}-redis php${version}-memcached; then
             warn "PHP ${version} install had errors — attempting dpkg repair"
             apt-get install -f -y 2>/dev/null || true
@@ -966,6 +966,77 @@ __install_tools() {
     esac
 }
 
+# ── fail2ban install + jails ──────────────────────────────────────────────────
+__install_fail2ban() {
+    log "Installing fail2ban..."
+    case "$PACKAGE_MANAGER" in
+        "apt")    apt-get install -y fail2ban ;;
+        "dnf"|"yum") $PACKAGE_MANAGER install -y fail2ban ;;
+        "zypper") zypper install -y fail2ban ;;
+    esac
+
+    # Write a single jail file covering all ISPConfig services.
+    # ignoreip includes loopback so nginx→apache backend traffic is never banned.
+    cat > /etc/fail2ban/jail.d/ispconfig.conf << EOF
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled  = true
+port     = ssh
+logpath  = %(sshd_log)s
+backend  = %(sshd_backend)s
+
+[postfix]
+enabled  = true
+port     = smtp,465,587
+logpath  = %(postfix_log)s
+backend  = %(postfix_backend)s
+
+[postfix-sasl]
+enabled  = true
+port     = smtp,465,587,imap,imaps,pop3,pop3s
+logpath  = %(postfix_log)s
+backend  = %(postfix_backend)s
+
+[dovecot]
+enabled  = true
+port     = imap,imaps,pop3,pop3s,sieve
+logpath  = %(dovecot_log)s
+backend  = %(dovecot_backend)s
+
+[proftpd]
+enabled  = true
+port     = ftp,ftp-data,ftps,ftps-data
+logpath  = %(proftpd_log)s
+backend  = %(proftpd_backend)s
+
+[ispconfig-panel]
+enabled  = true
+port     = ${ADMIN_PORT}
+logpath  = /var/log/ispconfig/auth.log
+maxretry = 5
+filter   = ispconfig-panel
+EOF
+
+    # Custom filter for ISPConfig panel login failures
+    cat > /etc/fail2ban/filter.d/ispconfig-panel.conf << 'FILTER_EOF'
+[Definition]
+failregex = ^.*\[client <HOST>\].*authentication failure.*$
+            ^.*Login failed for.*from <HOST>.*$
+ignoreregex =
+FILTER_EOF
+
+    # ISPConfig creates /var/log/ispconfig after install; pre-create so fail2ban
+    # can watch it immediately without errors on first start.
+    mkdir -p /var/log/ispconfig
+    touch /var/log/ispconfig/auth.log
+
+    systemctl enable fail2ban
+    systemctl restart fail2ban
+    log "fail2ban installed and configured"
+}
+
 # ── ISPConfig install ─────────────────────────────────────────────────────────
 __install_ispconfig() {
     log "Downloading ISPConfig..."
@@ -1111,8 +1182,12 @@ FWDEOF
             if [[ -n "$php_cgi_bin" ]]; then
                 local php_ver_dir
                 php_ver_dir=$(dirname "$(readlink -f "$php_cgi_bin")" 2>/dev/null | sed 's|/bin$||')
+                # Extract version from binary name (php-cgi does not support -r; use path parsing)
                 local php_ver
-                php_ver=$("$php_cgi_bin" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null)
+                php_ver=$(basename "$php_cgi_bin" | grep -oE '[0-9]+\.[0-9]+' | head -1)
+                # Fallback: ask the CLI binary if path parsing yields nothing
+                [[ -z "$php_ver" ]] && php_ver=$(command -v "php${PHP_DEFAULT}" >/dev/null 2>&1 && \
+                    "php${PHP_DEFAULT}" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null) || true
                 for starter in /var/www/php-fcgi-scripts/ispconfig/.php-fcgi-starter \
                                /var/www/php-fcgi-scripts/apps/.php-fcgi-starter; do
                     [[ -f "$starter" ]] || continue
@@ -1248,9 +1323,8 @@ __configure_ispconfig_nginx() {
     # nginx vhost for ISPConfig admin panel (port ADMIN_PORT → Apache admin port)
     cat > "${NGINX_VHOSTS_DIR}/ispconfig-panel.conf" << VHOST_EOF
 server {
-    listen      ${ADMIN_PORT} ssl;
-    listen      [::]:${ADMIN_PORT} ssl;
-    http2       on;
+    listen      ${ADMIN_PORT} ssl http2;
+    listen      [::]:${ADMIN_PORT} ssl http2;
     server_name _;
 
     ssl_certificate     ${SSL_DIR}/ispconfig.crt;
@@ -1286,9 +1360,8 @@ for cert_dir in /etc/letsencrypt/live/*/; do
     [[ -f "$fullchain" && -f "$privkey" ]] || continue
 
     new_content="server {
-    listen      443 ssl;
-    listen      [::]:443 ssl;
-    http2       on;
+    listen      443 ssl http2;
+    listen      [::]:443 ssl http2;
     server_name ${domain} www.${domain};
 
     ssl_certificate     ${fullchain};
@@ -1398,6 +1471,11 @@ EOF
 
     systemctl restart postfix dovecot proftpd 2>/dev/null || true
     nginx -t && systemctl start nginx
+
+    # Sync any existing Let's Encrypt certs into Nginx vhosts (no-op on fresh installs)
+    if [[ -d /etc/letsencrypt/live ]]; then
+        /usr/local/bin/ispconfig-nginx-sync 2>/dev/null || true
+    fi
 
     __create_php_test_script
 }
@@ -1544,6 +1622,7 @@ main() {
     __install_mail
     __install_ftp
     __install_tools
+    __install_fail2ban
 
     __install_ispconfig
 
