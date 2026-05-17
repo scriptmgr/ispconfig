@@ -852,6 +852,21 @@ MASTEREOF
     mkdir -p "$dkim_keys_dir"
 
     if [[ -f /etc/opendkim.conf ]]; then
+        # Locate the DNSSEC trust anchor — path differs by distro/package.
+        # TrustAnchorFile is optional; omit it when not present rather than
+        # hard-coding a path that may not exist (RHEL installs to a different
+        # location than Debian's /usr/share/dns/root.key).
+        local trust_anchor=""
+        for _ta in /usr/share/dns/root.key \
+                   /usr/share/dns-root-data/root.key \
+                   /var/lib/unbound/root.key \
+                   /etc/unbound/root.key; do
+            if [[ -f "$_ta" ]]; then
+                trust_anchor="TrustAnchorFile         ${_ta}"
+                break
+            fi
+        done
+
         cat > /etc/opendkim.conf << DKIMEOF
 Syslog                  yes
 SyslogSuccess           yes
@@ -868,7 +883,7 @@ UserID                  opendkim:opendkim
 UMask                   007
 Socket                  inet:8891@localhost
 PidFile                 /run/opendkim/opendkim.pid
-TrustAnchorFile         /usr/share/dns/root.key
+${trust_anchor}
 KeyTable                /etc/opendkim/KeyTable
 SigningTable            refile:/etc/opendkim/SigningTable
 ExternalIgnoreList      /etc/opendkim/TrustedHosts
