@@ -14,15 +14,15 @@ A comprehensive, distro-agnostic installation script for ISPConfig hosting contr
 
 ## 📋 Supported Distributions
 
-| Distribution | Versions | Package Manager |
-|---|---|---|
-| **Ubuntu** | 18.04, 20.04, 22.04, 24.04 | apt |
-| **Debian** | 9, 10, 11, 12, 13 | apt |
-| **CentOS / RHEL** | 7, 8, 9 | yum / dnf |
-| **AlmaLinux** | 8, 9, 10 | dnf |
-| **Rocky Linux** | 8, 9, 10 | dnf |
-| **Fedora** | 36–49 | dnf |
-| **openSUSE Leap / SLES** | 15.x | zypper |
+| Distribution | Versions | Package Manager | Status |
+|---|---|---|---|
+| **Ubuntu** | 18.04, 20.04, 22.04, 24.04 | apt | ✅ 24.04 tested |
+| **Debian** | 9, 10, 11, 12, 13 | apt | ✅ 12 tested |
+| **AlmaLinux** | 8, 9, 10 | dnf | ✅ 9 tested |
+| **Rocky Linux** | 8, 9, 10 | dnf | supported, untested |
+| **CentOS / RHEL** | 7, 8, 9 | yum / dnf | supported, untested |
+| **Fedora** | 36–49 | dnf | supported, untested |
+| **openSUSE Leap / SLES** | 15.x | zypper | supported, untested |
 
 ## 🚀 Quick Start
 
