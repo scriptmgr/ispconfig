@@ -983,51 +983,60 @@ __install_tools() {
 __install_fail2ban() {
     log "Installing fail2ban..."
     case "$PACKAGE_MANAGER" in
-        "apt")    apt-get install -y fail2ban ;;
-        "dnf"|"yum") $PACKAGE_MANAGER install -y fail2ban ;;
-        "zypper") zypper install -y fail2ban ;;
+        "apt")
+            apt-get install -y fail2ban
+            # python3-systemd is required for the systemd journal backend
+            apt-get install -y python3-systemd 2>/dev/null || true
+            ;;
+        "dnf"|"yum")
+            $PACKAGE_MANAGER install -y fail2ban
+            $PACKAGE_MANAGER install -y python3-systemd 2>/dev/null || true
+            ;;
+        "zypper")
+            zypper install -y fail2ban
+            zypper install -y python3-systemd 2>/dev/null || true
+            ;;
     esac
 
     # Write a single jail file covering all ISPConfig services.
+    # All service jails use backend=systemd so fail2ban reads the journal
+    # directly — no log files need to exist at startup. This works across
+    # all supported distros (all use systemd) including those that do not
+    # install rsyslog (Debian 12+, Ubuntu 22.04+, RHEL 9+).
     # ignoreip includes loopback so nginx→apache backend traffic is never banned.
     cat > /etc/fail2ban/jail.d/ispconfig.conf << EOF
 [DEFAULT]
 ignoreip = 127.0.0.1/8 ::1
+backend  = systemd
 
 [sshd]
 enabled  = true
 port     = ssh
-logpath  = %(sshd_log)s
-backend  = %(sshd_backend)s
 
 [postfix]
 enabled  = true
 port     = smtp,465,587
-logpath  = %(postfix_log)s
-backend  = %(postfix_backend)s
 
 [postfix-sasl]
 enabled  = true
 port     = smtp,465,587,imap,imaps,pop3,pop3s
-logpath  = %(postfix_log)s
-backend  = %(postfix_backend)s
 
 [dovecot]
 enabled  = true
 port     = imap,imaps,pop3,pop3s,sieve
-logpath  = %(dovecot_log)s
-backend  = %(dovecot_backend)s
 
 [proftpd]
 enabled  = true
 port     = ftp,ftp-data,ftps,ftps-data
-logpath  = %(proftpd_log)s
-backend  = %(proftpd_backend)s
+# ProFTPd logs to a file; override the global systemd backend
+logpath  = /var/log/proftpd/proftpd.log
+backend  = auto
 
 [ispconfig-panel]
 enabled  = true
 port     = ${ADMIN_PORT}
 logpath  = /var/log/ispconfig/auth.log
+backend  = auto
 maxretry = 5
 filter   = ispconfig-panel
 EOF
