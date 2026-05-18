@@ -20,9 +20,11 @@ A comprehensive, distro-agnostic installation script for ISPConfig hosting contr
 | **Debian** | 9, 10, 11, 12, 13 | apt | ✅ 12 tested |
 | **AlmaLinux** | 8, 9, 10 | dnf | ✅ 9 tested |
 | **Rocky Linux** | 8, 9, 10 | dnf | supported, untested |
-| **CentOS / RHEL** | 7, 8, 9 | yum / dnf | supported, untested |
+| **CentOS / RHEL** | 7, 8, 9 | yum / dnf | ⚠️ use at own risk — requires active subscription |
 | **Fedora** | 36–49 | dnf | supported, untested |
 | **openSUSE Leap / SLES** | 15.x | zypper | supported, untested |
+
+> **RHEL note:** This script is tested against AlmaLinux (a free RHEL rebuild). Vanilla RHEL requires an active subscription for package repos and uses different repo names for CodeReady Builder — the script may need manual repo adjustments. Rocky Linux 9 is expected to work identically to AlmaLinux 9 but has not been tested.
 
 ## 🚀 Quick Start
 
