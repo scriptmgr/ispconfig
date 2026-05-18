@@ -16,7 +16,8 @@ A comprehensive, distro-agnostic installation script for ISPConfig hosting contr
 
 | Distribution | Versions | Package Manager | Status |
 |---|---|---|---|
-| **Ubuntu** | 18.04, 20.04, 22.04, 24.04 | apt | ✅ 24.04 tested |
+| **Ubuntu** | 18.04–24.04 | apt | ✅ 24.04 tested |
+| **Ubuntu** | 25.x, 26.04 | apt | ⚠️ experimental — PHP 8.5 only; Dovecot 2.4 config pending |
 | **Debian** | 9, 10, 11, 12, 13 | apt | ✅ 12 tested |
 | **AlmaLinux** | 8, 9, 10 | dnf | ✅ 9 tested |
 | **Rocky Linux** | 8, 9, 10 | dnf | supported, untested |
@@ -25,6 +26,8 @@ A comprehensive, distro-agnostic installation script for ISPConfig hosting contr
 | **openSUSE Leap / SLES** | 15.x | zypper | supported, untested |
 
 > **RHEL note:** This script is tested against AlmaLinux (a free RHEL rebuild). Vanilla RHEL requires an active subscription for package repos and uses different repo names for CodeReady Builder — the script may need manual repo adjustments. Rocky Linux 9 is expected to work identically to AlmaLinux 9 but has not been tested.
+
+> **Ubuntu 25.x / 26.04 note:** These releases are detected and partially supported. The Ondrej PHP PPA does not yet carry packages for these codenames, so only the PHP version shipped natively by Ubuntu (8.5 on 26.04) is installed. Ubuntu 26.04 ships Dovecot 2.4, which has a breaking configuration format change (new `dovecot_config_version` header required, renamed settings, `passdb`/`userdb` block syntax change); full Dovecot 2.4 support is pending.
 
 ## 🚀 Quick Start
 

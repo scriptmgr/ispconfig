@@ -25,7 +25,7 @@ DISTRO_VERSION=""
 PACKAGE_MANAGER=""
 SERVICE_MANAGER="systemctl"
 PHP_DEFAULT="8.3"   # fallback; overwritten after install to highest available version
-PHP_VERSIONS=("8.4" "8.3" "8.2" "8.1" "8.0" "7.4" "7.3" "7.2" "7.1" "7.0" "5.6")
+PHP_VERSIONS=("8.5" "8.4" "8.3" "8.2" "8.1" "8.0" "7.4" "7.3" "7.2" "7.1" "7.0" "5.6")
 
 # Reverse proxy settings
 APACHE_BACKEND_IP="127.0.0.1"
@@ -571,23 +571,20 @@ __install_php() {
 __install_php_debian() {
     log "Adding Ondrej PHP repository..."
     if [[ "$DISTRO" == "ubuntu" ]]; then
-        add-apt-repository -y ppa:ondrej/php
-        # If this Ubuntu codename is not yet in the PPA (brand-new release), fall back to
-        # the previous LTS codename (noble/24.04) which ships binary-compatible packages.
+        # Only add the Ondrej PPA if it has a release for this Ubuntu codename.
+        # Brand-new Ubuntu releases (e.g. 26.04/resolute) may not yet be in the PPA;
+        # using a mismatched-codename fallback causes ABI breakage because the compiled
+        # PHP binaries depend on system library sonames that have changed.  When the PPA
+        # has no release for this codename we skip it and rely on the distro's native PHP
+        # packages (e.g. PHP 8.5 ships natively on Ubuntu 26.04).
         local _codename
         _codename=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_CODENAME:-}")
-        if [[ -n "$_codename" ]]; then
-            if ! curl -sfI \
-                    "https://ppa.launchpadcontent.net/ondrej/php/ubuntu/dists/${_codename}/Release" \
-                    >/dev/null 2>&1; then
-                warn "Ondrej PPA has no release for '${_codename}' — using noble (24.04) packages"
-                local _src
-                _src=$(find /etc/apt/sources.list.d/ -name 'ondrej*php*' | head -1)
-                if [[ -n "$_src" ]]; then
-                    sed -i "s/Suites: ${_codename}/Suites: noble/g" "$_src"
-                    sed -i "s/ ${_codename} / noble /g" "$_src"
-                fi
-            fi
+        if [[ -z "$_codename" ]] || curl -sfI \
+                "https://ppa.launchpadcontent.net/ondrej/php/ubuntu/dists/${_codename}/Release" \
+                >/dev/null 2>&1; then
+            add-apt-repository -y ppa:ondrej/php
+        else
+            warn "Ondrej PPA has no release for '${_codename}' — using distro PHP packages only"
         fi
     else
         wget -qO /etc/apt/trusted.gpg.d/php.gpg https://packages.sury.org/php/apt.gpg
@@ -608,23 +605,28 @@ __install_php_debian() {
         fi
         log "Installing PHP ${version}..."
 
-        # Core packages — required for every version
+        # Install core runtime packages — these must exist if the version is available.
         # Note: php${version}-pcntl is NOT a separate package on Ondrej PPA;
         # PCNTL is compiled into the PHP CLI binary directly.
         if ! apt-get install -y \
             php${version} php${version}-cli php${version}-fpm php${version}-cgi \
-            php${version}-common php${version}-mysql php${version}-pgsql \
-            php${version}-sqlite3 php${version}-gd php${version}-imagick \
-            php${version}-mbstring php${version}-xml php${version}-curl \
-            php${version}-zip php${version}-soap php${version}-intl \
-            php${version}-bcmath php${version}-opcache php${version}-readline \
-            php${version}-bz2 php${version}-xsl php${version}-tidy \
-            php${version}-ldap php${version}-imap php${version}-gettext \
-            php${version}-exif php${version}-sockets \
-            php${version}-redis php${version}-memcached; then
-            warn "PHP ${version} install had errors — attempting dpkg repair"
+            php${version}-common; then
+            warn "PHP ${version} core install failed — skipping this version"
             apt-get install -f -y 2>/dev/null || true
+            continue
         fi
+
+        # Install extension packages one at a time, skipping any that are missing.
+        # Some extensions (opcache, imap, gettext, exif, sockets) are built directly
+        # into the PHP binary from certain versions onward and have no separate package.
+        for ext in mysql pgsql sqlite3 gd imagick mbstring xml curl zip soap intl \
+                   bcmath opcache readline bz2 xsl tidy ldap imap gettext exif sockets \
+                   redis memcached; do
+            local pkg="php${version}-${ext}"
+            if apt-cache show "$pkg" >/dev/null 2>&1; then
+                apt-get install -y "$pkg" 2>/dev/null || true
+            fi
+        done
 
         # json is a separate package on PHP < 8.0 (built-in from 8.0 onward)
         if dpkg --compare-versions "${version}" lt "8.0" 2>/dev/null; then
