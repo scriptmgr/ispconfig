@@ -84,7 +84,7 @@ __validate_distro() {
     local supported=false
     case "$DISTRO" in
         "ubuntu")
-            [[ "$DISTRO_VERSION" =~ ^(18|20|22|24) ]] && supported=true && PACKAGE_MANAGER="apt"
+            [[ "$DISTRO_VERSION" =~ ^(18|20|22|24|25|26) ]] && supported=true && PACKAGE_MANAGER="apt"
             NGINX_USER="www-data"
             SSL_CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
             APACHE_SERVICE="apache2"
@@ -145,7 +145,7 @@ __validate_distro() {
 
     if [[ "$supported" != "true" ]]; then
         error "Unsupported distribution: $DISTRO $DISTRO_VERSION
-Supported: Ubuntu 18-24, Debian 9-13, CentOS/RHEL 7-9, AlmaLinux/Rocky 8-10, Fedora 36-49, openSUSE Leap 15.x"
+Supported: Ubuntu 18-26, Debian 9-13, CentOS/RHEL 7-9, AlmaLinux/Rocky 8-10, Fedora 36-49, openSUSE Leap 15.x"
     fi
     success "Distribution $DISTRO $DISTRO_VERSION is supported (${PACKAGE_MANAGER})"
 }
@@ -572,6 +572,23 @@ __install_php_debian() {
     log "Adding Ondrej PHP repository..."
     if [[ "$DISTRO" == "ubuntu" ]]; then
         add-apt-repository -y ppa:ondrej/php
+        # If this Ubuntu codename is not yet in the PPA (brand-new release), fall back to
+        # the previous LTS codename (noble/24.04) which ships binary-compatible packages.
+        local _codename
+        _codename=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_CODENAME:-}")
+        if [[ -n "$_codename" ]]; then
+            if ! curl -sfI \
+                    "https://ppa.launchpadcontent.net/ondrej/php/ubuntu/dists/${_codename}/Release" \
+                    >/dev/null 2>&1; then
+                warn "Ondrej PPA has no release for '${_codename}' — using noble (24.04) packages"
+                local _src
+                _src=$(find /etc/apt/sources.list.d/ -name 'ondrej*php*' | head -1)
+                if [[ -n "$_src" ]]; then
+                    sed -i "s/Suites: ${_codename}/Suites: noble/g" "$_src"
+                    sed -i "s/ ${_codename} / noble /g" "$_src"
+                fi
+            fi
+        fi
     else
         wget -qO /etc/apt/trusted.gpg.d/php.gpg https://packages.sury.org/php/apt.gpg
         echo "deb https://packages.sury.org/php/ $(lsb_release -sc) main" > /etc/apt/sources.list.d/php.list
