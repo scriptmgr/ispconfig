@@ -1356,6 +1356,38 @@ RIPEOF
                         "$f"
                 done
             done
+
+            # Fix ISPConfig panel PHP-FCGI starters: point to actual installed PHP-CGI.
+            # On RHEL-family, PHP-CGI lives under /opt/remi/phpXX/root/usr/bin/php-cgi
+            # (no system-wide /usr/bin/php-cgi); PHPRC is /etc/opt/remi/phpXX/.
+            local rhel_php_cgi=""
+            local rhel_php_ver=""
+            for _v in 85 84 83 82 81 80 74; do
+                local _bin="/opt/remi/php${_v}/root/usr/bin/php-cgi"
+                if [[ -x "$_bin" ]]; then
+                    rhel_php_cgi="$_bin"
+                    rhel_php_ver="${_v:0:1}.${_v:1}"
+                    break
+                fi
+            done
+            if [[ -n "$rhel_php_cgi" ]]; then
+                local rhel_phprc="/etc/opt/remi/php${rhel_php_ver//./}/"
+                for starter in /var/www/php-fcgi-scripts/ispconfig/.php-fcgi-starter \
+                               /var/www/php-fcgi-scripts/apps/.php-fcgi-starter; do
+                    [[ -f "$starter" ]] || continue
+                    local _tmp
+                    _tmp=$(mktemp)
+                    chattr -i "$starter" 2>/dev/null || true
+                    sed \
+                        -e "s|PHPRC=.*|PHPRC=${rhel_phprc}|" \
+                        -e "s|exec /usr/bin/php-cgi|exec ${rhel_php_cgi}|" \
+                        "$starter" > "$_tmp" && cp "$_tmp" "$starter"
+                    chattr +i "$starter" 2>/dev/null || true
+                    rm -f "$_tmp"
+                    log "Patched ${starter} → ${rhel_php_cgi}"
+                done
+            fi
+
             systemctl restart "${APACHE_SERVICE}"
             ;;
     esac
