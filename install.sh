@@ -774,7 +774,11 @@ __install_mail() {
             ;;
     esac
     systemctl enable postfix dovecot
-    systemctl start  postfix dovecot
+    systemctl start  postfix 2>/dev/null || true
+    # Dovecot start failures are non-fatal here — Dovecot 2.4 (Ubuntu 26.04)
+    # requires config changes not yet applied; ISPConfig will write the final
+    # config and restart dovecot during its autoinstall phase.
+    systemctl start  dovecot 2>/dev/null || true
 }
 
 __configure_mail_public() {
@@ -1083,10 +1087,12 @@ failregex = ^.*\[client <HOST>\].*authentication failure.*$
 ignoreregex =
 FILTER_EOF
 
-    # ISPConfig creates /var/log/ispconfig after install; pre-create so fail2ban
-    # can watch it immediately without errors on first start.
+    # Pre-create log files that fail2ban watches so it can start without errors
+    # even before the services have written anything.
     mkdir -p /var/log/ispconfig
     touch /var/log/ispconfig/auth.log
+    mkdir -p /var/log/proftpd
+    touch /var/log/proftpd/proftpd.log
 
     systemctl enable fail2ban
     systemctl restart fail2ban
@@ -1247,10 +1253,17 @@ FWDEOF
                 for starter in /var/www/php-fcgi-scripts/ispconfig/.php-fcgi-starter \
                                /var/www/php-fcgi-scripts/apps/.php-fcgi-starter; do
                     [[ -f "$starter" ]] || continue
-                    sed -i \
+                    # ISPConfig sets the immutable flag on this file; lift it temporarily,
+                    # write via tmp+cp (sed -i rename also fails on immutable files), restore.
+                    local _tmp
+                    _tmp=$(mktemp)
+                    chattr -i "$starter" 2>/dev/null || true
+                    sed \
                         -e "s|PHPRC=.*|PHPRC=/etc/php/${php_ver}/cgi/|" \
                         -e "s|exec /usr/bin/php-cgi|exec ${php_cgi_bin}|" \
-                        "$starter"
+                        "$starter" > "$_tmp" && cp "$_tmp" "$starter"
+                    chattr +i "$starter" 2>/dev/null || true
+                    rm -f "$_tmp"
                 done
             fi
             systemctl restart apache2
