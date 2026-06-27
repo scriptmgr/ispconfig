@@ -250,6 +250,8 @@ __configure_firewall() {
             for port in 21 25 110 143 465 587 993 995 53 $ADMIN_PORT; do ufw allow ${port}/tcp; done
             ufw allow 53/udp
             ufw allow 49152:65534/tcp
+            # Mosh server uses UDP 60000-61000 for encrypted remote terminal sessions
+            ufw allow 60000:61000/udp
             ;;
         *)
             if command -v firewall-cmd &>/dev/null; then
@@ -260,6 +262,8 @@ __configure_firewall() {
                 for port in 21 49152-65534 ${ADMIN_PORT} 587; do
                     firewall-cmd --permanent --add-port=${port}/tcp
                 done
+                # Mosh server uses UDP 60000-61000 for encrypted remote terminal sessions
+                firewall-cmd --permanent --add-port=60000-61000/udp
                 firewall-cmd --reload
             fi
             ;;
