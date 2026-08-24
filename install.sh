@@ -1,4 +1,26 @@
 #!/bin/bash
+# shellcheck shell=bash
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+##@Version           :  202608241544-git
+# @@Author           :  ISPConfig Universal Installer Contributors
+# @@Contact          :  https://github.com/scriptmgr/ispconfig
+# @@License          :  MIT
+# @@ReadME           :  README.md
+# @@Copyright        :  Copyright: (c) 2025 ISPConfig Universal Installer Contributors
+# @@Created          :  Monday, August 24, 2026 15:34 EDT
+# @@File             :  install.sh
+# @@Description      :  Universal distro-agnostic ISPConfig installer with Nginx reverse proxy, multi-PHP, and full mail stack
+# @@Changelog        :  Fix MySQL TCP connection for ISPConfig autoinstall; resolve script-lint violations
+# @@TODO             :  none
+# @@Other            :  none
+# @@Resource         :  https://www.ispconfig.org/
+# @@Terminal App     :  yes
+# @@sudo/root        :  yes
+# @@Template         :  shell/bash
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+# shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+VERSION="202608241544-git"
 
 # Universal ISPConfig Installation Script
 # Architecture: Nginx (frontend, SSL termination) → Apache (backend, 127.0.0.1:81)
@@ -16,7 +38,7 @@ NC='\033[0m'
 
 # ── Global variables ──────────────────────────────────────────────────────────
 ADMIN_PORT=64245
-MYSQL_ROOT_PASSWORD=""
+ISPCONFIG_MYSQL_ROOT_PASSWORD=""
 ISPCONFIG_ADMIN_PASSWORD=""
 ISPCONFIG_DB_PASSWORD=""
 HOSTNAME=""
@@ -24,7 +46,8 @@ DISTRO=""
 DISTRO_VERSION=""
 PACKAGE_MANAGER=""
 SERVICE_MANAGER="systemctl"
-PHP_DEFAULT="8.3"   # fallback; overwritten after install to highest available version
+# fallback; overwritten after install to highest available version
+PHP_DEFAULT="8.3"
 PHP_VERSIONS=("8.5" "8.4" "8.3" "8.2" "8.1" "8.0" "7.4" "7.3" "7.2" "7.1" "7.0" "5.6")
 
 # Reverse proxy settings
@@ -45,38 +68,38 @@ APACHE_VHOST_DIR=""
 APACHE_CONF_EXTRA=""
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-log()     { echo -e "${GREEN}[INFO]${NC} $1"; }
-warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
-error()   { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
-success() { echo -e "${BLUE}[SUCCESS]${NC} $1"; }
+__log()     { echo -e "${GREEN}[INFO]${NC} $1"; }
+__warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
+__error()   { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+__success() { echo -e "${BLUE}[SUCCESS]${NC} $1"; }
 
 # ── Root check ────────────────────────────────────────────────────────────────
 __check_root() {
     if [[ $EUID -ne 0 ]]; then
-        error "This script must be run as root"
+        __error "This script must be run as root"
     fi
 }
 
 # ── Distro detection ──────────────────────────────────────────────────────────
 __detect_distro() {
-    log "Detecting Linux distribution..."
+    __log "Detecting Linux distribution..."
     if [[ -f /etc/os-release ]]; then
         . /etc/os-release
         DISTRO="$ID"
         DISTRO_VERSION="$VERSION_ID"
     elif [[ -f /etc/debian_version ]]; then
         DISTRO="debian"
-        DISTRO_VERSION=$(cat /etc/debian_version)
+        DISTRO_VERSION=$(< /etc/debian_version)
     elif [[ -f /etc/redhat-release ]]; then
-        grep -q "CentOS"    /etc/redhat-release && DISTRO="centos"
-        grep -q "Red Hat"   /etc/redhat-release && DISTRO="rhel"
-        grep -q "AlmaLinux" /etc/redhat-release && DISTRO="almalinux"
-        grep -q "Rocky"     /etc/redhat-release && DISTRO="rocky"
-        DISTRO_VERSION=$(grep -oE '[0-9]+\.[0-9]+' /etc/redhat-release | head -1)
+        grep -q -- "CentOS"    /etc/redhat-release && DISTRO="centos"
+        grep -q -- "Red Hat"   /etc/redhat-release && DISTRO="rhel"
+        grep -q -- "AlmaLinux" /etc/redhat-release && DISTRO="almalinux"
+        grep -q -- "Rocky"     /etc/redhat-release && DISTRO="rocky"
+        DISTRO_VERSION=$(grep -oE -- '[0-9]+\.[0-9]+' /etc/redhat-release | head -1)
     else
-        error "Cannot detect Linux distribution"
+        __error "Cannot detect Linux distribution"
     fi
-    log "Detected: $DISTRO $DISTRO_VERSION"
+    __log "Detected: $DISTRO $DISTRO_VERSION"
     __validate_distro
 }
 
@@ -144,25 +167,25 @@ __validate_distro() {
     esac
 
     if [[ "$supported" != "true" ]]; then
-        error "Unsupported distribution: $DISTRO $DISTRO_VERSION
+        __error "Unsupported distribution: $DISTRO $DISTRO_VERSION
 Supported: Ubuntu 18-26, Debian 9-13, CentOS/RHEL 7-9, AlmaLinux/Rocky 8-10, Fedora 36-49, openSUSE Leap 15.x"
     fi
-    success "Distribution $DISTRO $DISTRO_VERSION is supported (${PACKAGE_MANAGER})"
+    __success "Distribution $DISTRO $DISTRO_VERSION is supported (${PACKAGE_MANAGER})"
 }
 
 # ── Passwords ─────────────────────────────────────────────────────────────────
 __generate_passwords() {
-    if [[ -z "$MYSQL_ROOT_PASSWORD" ]]; then
-        MYSQL_ROOT_PASSWORD=$(openssl rand -base64 32)
-        log "Generated MySQL root password"
+    if [[ -z "$ISPCONFIG_MYSQL_ROOT_PASSWORD" ]]; then
+        ISPCONFIG_MYSQL_ROOT_PASSWORD=$(openssl rand -base64 32)
+        __log "Generated MySQL root password"
     fi
     if [[ -z "$ISPCONFIG_ADMIN_PASSWORD" ]]; then
         ISPCONFIG_ADMIN_PASSWORD=$(openssl rand -base64 32)
-        log "Generated ISPConfig admin password"
+        __log "Generated ISPConfig admin password"
     fi
     if [[ -z "$ISPCONFIG_DB_PASSWORD" ]]; then
         ISPCONFIG_DB_PASSWORD=$(openssl rand -base64 32)
-        log "Generated ISPConfig DB user password"
+        __log "Generated ISPConfig DB user password"
     fi
 }
 
@@ -192,12 +215,12 @@ __set_hostname() {
     sed -i "/[[:space:]]${base_hostname}\b/d" /etc/hosts
     echo "${ip}    ${HOSTNAME} ${base_hostname}" >> /etc/hosts
 
-    log "Hostname configured: ${HOSTNAME}"
+    __log "Hostname configured: ${HOSTNAME}"
 }
 
 # ── System update ─────────────────────────────────────────────────────────────
 __update_system() {
-    log "Updating system packages..."
+    __log "Updating system packages..."
     case "$PACKAGE_MANAGER" in
         "apt")
             export DEBIAN_FRONTEND=noninteractive
@@ -225,7 +248,7 @@ __update_system() {
 
 # ── Base packages ─────────────────────────────────────────────────────────────
 __install_base_packages() {
-    log "Installing base packages..."
+    __log "Installing base packages..."
     case "$PACKAGE_MANAGER" in
         "apt")
             apt-get install -y wget curl vim net-tools dnsutils openssl ssl-cert
@@ -241,7 +264,7 @@ __install_base_packages() {
 
 # ── Firewall ──────────────────────────────────────────────────────────────────
 __configure_firewall() {
-    log "Configuring firewall..."
+    __log "Configuring firewall..."
     case "$DISTRO" in
         "ubuntu"|"debian")
             command -v ufw &>/dev/null || apt-get install -y ufw
@@ -272,7 +295,7 @@ __configure_firewall() {
 
 # ── Nginx install + config ────────────────────────────────────────────────────
 __install_nginx() {
-    log "Installing Nginx..."
+    __log "Installing Nginx..."
     case "$PACKAGE_MANAGER" in
         "apt")
             apt-get install -y nginx
@@ -289,7 +312,7 @@ __install_nginx() {
     # once Apache is already running on the backend port.
     systemctl stop nginx 2>/dev/null || true
 
-    log "Building Nginx configuration..."
+    __log "Building Nginx configuration..."
 
     # Wipe everything except mime.types
     find /etc/nginx -mindepth 1 -maxdepth 1 ! -name 'mime.types' -exec rm -rf {} \;
@@ -482,13 +505,13 @@ server {
 }
 VHOST_EOF
 
-    log "Nginx installed and configured (vhosts.d panel vhost added post-ISPConfig)"
+    __log "Nginx installed and configured (vhosts.d panel vhost added post-ISPConfig)"
     systemctl enable nginx
 }
 
 # ── Apache install ────────────────────────────────────────────────────────────
 __install_apache() {
-    log "Installing Apache web server..."
+    __log "Installing Apache web server..."
     case "$PACKAGE_MANAGER" in
         "apt")
             apt-get install -y apache2 apache2-utils libapache2-mod-fcgid apache2-suexec-pristine
@@ -511,7 +534,7 @@ __install_apache() {
 
 # ── MariaDB ───────────────────────────────────────────────────────────────────
 __install_mysql() {
-    log "Installing MariaDB server..."
+    __log "Installing MariaDB server..."
     case "$PACKAGE_MANAGER" in
         "apt")       apt-get install -y mariadb-server mariadb-client ;;
         "dnf"|"yum") $PACKAGE_MANAGER install -y mariadb-server mariadb ;;
@@ -525,7 +548,7 @@ __install_mysql() {
     local MYSQL_BIN="mysql"
     command -v mariadb >/dev/null 2>&1 && MYSQL_BIN="mariadb"
 
-    log "Securing MariaDB (${MYSQL_BIN})..."
+    __log "Securing MariaDB (${MYSQL_BIN})..."
 
     # Determine how to connect for initial setup.
     # Debian 10.4+ maps unix_socket auth to the 'mysql' OS user, not 'root'.
@@ -536,16 +559,25 @@ __install_mysql() {
     elif ${MYSQL_BIN} -e "SELECT 1" >/dev/null 2>&1; then
         INIT_CMD="${MYSQL_BIN}"
     else
-        error "Cannot connect to MariaDB for initial setup — check installation"
+        __error "Cannot connect to MariaDB for initial setup — check installation"
     fi
 
     # Set root password, trying modern then legacy syntax
-    ${INIT_CMD} -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}'" 2>/dev/null || \
-    ${INIT_CMD} -e "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('${MYSQL_ROOT_PASSWORD}')" 2>/dev/null || \
-    ${INIT_CMD} -e "UPDATE mysql.user SET Password=PASSWORD('${MYSQL_ROOT_PASSWORD}') WHERE User='root'; FLUSH PRIVILEGES;"
+    ${INIT_CMD} -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${ISPCONFIG_MYSQL_ROOT_PASSWORD}'" 2>/dev/null || \
+    ${INIT_CMD} -e "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('${ISPCONFIG_MYSQL_ROOT_PASSWORD}')" 2>/dev/null || \
+    ${INIT_CMD} -e "UPDATE mysql.user SET Password=PASSWORD('${ISPCONFIG_MYSQL_ROOT_PASSWORD}') WHERE User='root'; FLUSH PRIVILEGES;"
 
     # All subsequent operations use password auth
-    local MYSQL="${MYSQL_BIN} -u root -p${MYSQL_ROOT_PASSWORD}"
+    local MYSQL="${MYSQL_BIN} -u root -p${ISPCONFIG_MYSQL_ROOT_PASSWORD}"
+
+    # ISPConfig's autoinstaller connects over TCP (127.0.0.1) rather than the
+    # Unix socket, since PHP's compiled-in default socket path can mismatch
+    # MariaDB's actual socket across the multiple PHP builds this script
+    # installs. Default MariaDB installs only create root@localhost, so add
+    # a root@127.0.0.1 user with the same password for the TCP connection.
+    ${MYSQL} -e "CREATE USER IF NOT EXISTS 'root'@'127.0.0.1' IDENTIFIED BY '${ISPCONFIG_MYSQL_ROOT_PASSWORD}'"
+    ${MYSQL} -e "GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION"
+
     ${MYSQL} -e "DELETE FROM mysql.user WHERE User=''"
     ${MYSQL} -e "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost','127.0.0.1','::1')"
     ${MYSQL} -e "DROP DATABASE IF EXISTS test"
@@ -555,15 +587,15 @@ __install_mysql() {
     cat > /root/.my.cnf << EOF
 [client]
 user=root
-password=${MYSQL_ROOT_PASSWORD}
+password=${ISPCONFIG_MYSQL_ROOT_PASSWORD}
 EOF
     chmod 600 /root/.my.cnf
-    success "MariaDB secured"
+    __success "MariaDB secured"
 }
 
 # ── PHP ───────────────────────────────────────────────────────────────────────
 __install_php() {
-    log "Installing multiple PHP versions..."
+    __log "Installing multiple PHP versions..."
     case "$DISTRO" in
         "ubuntu"|"debian")            __install_php_debian ;;
         "centos"|"rhel"|"almalinux"|"rocky"|"fedora") __install_php_rhel ;;
@@ -573,7 +605,7 @@ __install_php() {
 }
 
 __install_php_debian() {
-    log "Adding Ondrej PHP repository..."
+    __log "Adding Ondrej PHP repository..."
     if [[ "$DISTRO" == "ubuntu" ]]; then
         # Only add the Ondrej PPA if it has a release for this Ubuntu codename.
         # Brand-new Ubuntu releases (e.g. 26.04/resolute) may not yet be in the PPA;
@@ -588,7 +620,7 @@ __install_php_debian() {
                 >/dev/null 2>&1; then
             add-apt-repository -y ppa:ondrej/php
         else
-            warn "Ondrej PPA has no release for '${_codename}' — using distro PHP packages only"
+            __warn "Ondrej PPA has no release for '${_codename}' — using distro PHP packages only"
         fi
     else
         wget -qO /etc/apt/trusted.gpg.d/php.gpg https://packages.sury.org/php/apt.gpg
@@ -604,10 +636,10 @@ __install_php_debian() {
     for version in "${PHP_VERSIONS[@]}"; do
         # Skip versions not available in the configured repos
         if ! apt-cache show "php${version}" >/dev/null 2>&1; then
-            warn "PHP ${version} not available in repos — skipping"
+            __warn "PHP ${version} not available in repos — skipping"
             continue
         fi
-        log "Installing PHP ${version}..."
+        __log "Installing PHP ${version}..."
 
         # Install core runtime packages — these must exist if the version is available.
         # Note: php${version}-pcntl is NOT a separate package on Ondrej PPA;
@@ -615,7 +647,7 @@ __install_php_debian() {
         if ! apt-get install -y \
             php${version} php${version}-cli php${version}-fpm php${version}-cgi \
             php${version}-common; then
-            warn "PHP ${version} core install failed — skipping this version"
+            __warn "PHP ${version} core install failed — skipping this version"
             apt-get install -f -y 2>/dev/null || true
             continue
         fi
@@ -649,7 +681,7 @@ __install_php_debian() {
             break
         fi
     done
-    log "Setting PHP ${PHP_DEFAULT} as system default"
+    __log "Setting PHP ${PHP_DEFAULT} as system default"
     update-alternatives --set php     "/usr/bin/php${PHP_DEFAULT}"     2>/dev/null || true
     update-alternatives --set php-cgi "/usr/bin/php-cgi${PHP_DEFAULT}" 2>/dev/null || true
 
@@ -660,20 +692,20 @@ __install_php_debian() {
 }
 
 __install_php_rhel() {
-    log "Adding Remi PHP repository..."
+    __log "Adding Remi PHP repository..."
     local major_version
-    major_version=$(echo "$DISTRO_VERSION" | cut -d. -f1)
+    major_version="${DISTRO_VERSION%%.*}"
     $PACKAGE_MANAGER install -y "https://rpms.remirepo.net/enterprise/remi-release-${major_version}.rpm" 2>/dev/null || \
-        warn "Remi repo install failed for version ${major_version}"
+        __warn "Remi repo install failed for version ${major_version}"
 
     for version in "${PHP_VERSIONS[@]}"; do
         local vc=${version//./}
         # Skip versions not available in Remi
         if ! $PACKAGE_MANAGER info --enablerepo=remi "php${vc}" >/dev/null 2>&1; then
-            warn "PHP ${version} not available in Remi — skipping"
+            __warn "PHP ${version} not available in Remi — skipping"
             continue
         fi
-        log "Installing PHP ${version}..."
+        __log "Installing PHP ${version}..."
         if ! $PACKAGE_MANAGER install -y --enablerepo=remi \
             php${vc} php${vc}-php-cli php${vc}-php-fpm php${vc}-php-cgi \
             php${vc}-php-common php${vc}-php-mysqlnd php${vc}-php-pgsql \
@@ -685,7 +717,7 @@ __install_php_rhel() {
             php${vc}-php-pecl-redis php${vc}-php-pecl-memcached \
             php${vc}-php-tidy php${vc}-php-exif php${vc}-php-sockets \
             php${vc}-php-pcntl php${vc}-php-sqlite3; then
-            warn "PHP ${version} install had errors — some modules may be missing"
+            __warn "PHP ${version} install had errors — some modules may be missing"
         fi
         ln -sf /opt/remi/php${vc}/root/usr/bin/php /usr/local/bin/php${version} 2>/dev/null || true
         systemctl enable php${vc}-php-fpm 2>/dev/null || true
@@ -700,7 +732,7 @@ __install_php_rhel() {
         fi
     done
     local dvc="${PHP_DEFAULT//./}"
-    log "Setting PHP ${PHP_DEFAULT} as system default"
+    __log "Setting PHP ${PHP_DEFAULT} as system default"
     alternatives --install /usr/bin/php php /opt/remi/php${dvc}/root/usr/bin/php 100 2>/dev/null || true
 }
 
@@ -708,19 +740,19 @@ __install_php_suse() {
     local available=("8.2" "8.1" "8.0" "7.4")
     for version in "${available[@]}"; do
         local vc=${version//./}
-        log "Installing PHP ${version}..."
+        __log "Installing PHP ${version}..."
         zypper install -y \
             php${vc} php${vc}-cli php${vc}-fpm php${vc}-mysql \
             php${vc}-gd php${vc}-mbstring php${vc}-xml php${vc}-curl \
             php${vc}-zip php${vc}-soap php${vc}-intl php${vc}-bcmath \
-            php${vc}-opcache 2>/dev/null || warn "Some PHP ${version} packages unavailable"
+            php${vc}-opcache 2>/dev/null || __warn "Some PHP ${version} packages unavailable"
         systemctl enable php-fpm 2>/dev/null || true
         systemctl start  php-fpm 2>/dev/null || true
     done
 }
 
 __configure_php_versions() {
-    log "Tuning PHP ini files..."
+    __log "Tuning PHP ini files..."
     while IFS= read -r -d '' php_ini; do
         sed -i \
             -e 's/^;date.timezone =.*/date.timezone = UTC/' \
@@ -737,7 +769,7 @@ __configure_php_versions() {
 
 # ── Mail ──────────────────────────────────────────────────────────────────────
 __install_mail() {
-    log "Installing mail services (Postfix + Dovecot)..."
+    __log "Installing mail services (Postfix + Dovecot)..."
     case "$PACKAGE_MANAGER" in
         "apt")
             # Required — script fails if these are missing
@@ -748,7 +780,7 @@ __install_mail() {
                 libsasl2-modules libsasl2-2 sasl2-bin
             # Optional — DKIM; warn and continue if unavailable
             apt-get install -y opendkim opendkim-tools \
-                || warn "opendkim not available — DKIM will be skipped"
+                || __warn "opendkim not available — DKIM will be skipped"
             ;;
         "dnf"|"yum")
             # CRB (CodeReady Builder / powertools) is required for sendmail-milter
@@ -767,14 +799,14 @@ __install_mail() {
             $PACKAGE_MANAGER install -y libmemcached-awesome 2>/dev/null \
                 || $PACKAGE_MANAGER install -y libmemcached 2>/dev/null || true
             $PACKAGE_MANAGER install -y opendkim opendkim-tools \
-                || warn "opendkim not available — DKIM will be skipped"
+                || __warn "opendkim not available — DKIM will be skipped"
             ;;
         "zypper")
             zypper install -y \
                 postfix postfix-mysql \
                 dovecot dovecot-backend-mysql
             zypper install -y opendkim 2>/dev/null \
-                || warn "opendkim not available — DKIM will be skipped"
+                || __warn "opendkim not available — DKIM will be skipped"
             ;;
     esac
     systemctl enable postfix dovecot
@@ -786,7 +818,7 @@ __install_mail() {
 }
 
 __configure_mail_public() {
-    log "Configuring mail for public use (inbound + outbound + secure retrieval)..."
+    __log "Configuring mail for public use (inbound + outbound + secure retrieval)..."
 
     # ── Postfix: TLS and delivery hardening ──────────────────────────────────
     # Use ISPConfig's SSL cert for mail TLS (already created by ISPConfig install)
@@ -824,7 +856,7 @@ __configure_mail_public() {
     postconf -e "smtpd_delay_reject = yes"
 
     # ── Postfix master.cf: ensure submission (587) and smtps (465) are active ─
-    if ! grep -q "^submission " /etc/postfix/master.cf; then
+    if ! grep -q -- "^submission " /etc/postfix/master.cf; then
         cat >> /etc/postfix/master.cf << 'MASTEREOF'
 submission inet n       -       n       -       -       smtpd
   -o syslog_name=postfix/submission
@@ -834,10 +866,10 @@ submission inet n       -       n       -       -       smtpd
   -o smtpd_recipient_restrictions=permit_sasl_authenticated,reject
   -o milter_macro_daemon_name=ORIGINATING
 MASTEREOF
-        log "Enabled SMTP submission on port 587"
+        __log "Enabled SMTP submission on port 587"
     fi
 
-    if ! grep -q "^smtps " /etc/postfix/master.cf; then
+    if ! grep -q -- "^smtps " /etc/postfix/master.cf; then
         cat >> /etc/postfix/master.cf << 'MASTEREOF'
 smtps inet n       -       n       -       -       smtpd
   -o syslog_name=postfix/smtps
@@ -846,7 +878,7 @@ smtps inet n       -       n       -       -       smtpd
   -o smtpd_recipient_restrictions=permit_sasl_authenticated,reject
   -o milter_macro_daemon_name=ORIGINATING
 MASTEREOF
-        log "Enabled SMTPS on port 465"
+        __log "Enabled SMTPS on port 465"
     fi
 
     # ── Dovecot: SSL and secure-listener hardening ───────────────────────────
@@ -863,7 +895,7 @@ MASTEREOF
                 -e "s|^ssl_key = .*|ssl_key = <${mail_key}|" \
                 "$dovecot_ssl_conf"
         fi
-        if grep -q "ssl_min_protocol\|ssl_protocols" "$dovecot_ssl_conf"; then
+        if grep -q -- "ssl_min_protocol\|ssl_protocols" "$dovecot_ssl_conf"; then
             sed -i \
                 -e "s|^ssl_min_protocol = .*|ssl_min_protocol = TLSv1.2|" \
                 -e "s|^ssl_protocols = .*|ssl_min_protocol = TLSv1.2|" \
@@ -932,7 +964,7 @@ TRUSTEOF
     # Wire OpenDKIM milter into Postfix
     postconf -e "milter_protocol = 6"
     postconf -e "milter_default_action = accept"
-    if ! postconf smtpd_milters 2>/dev/null | grep -q "8891"; then
+    if ! postconf smtpd_milters 2>/dev/null | grep -q -- "8891"; then
         postconf -e "smtpd_milters = inet:localhost:8891"
         postconf -e "non_smtpd_milters = inet:localhost:8891"
     fi
@@ -941,21 +973,21 @@ TRUSTEOF
     systemctl start  opendkim 2>/dev/null || true
 
     systemctl restart postfix dovecot 2>/dev/null || true
-    success "Mail configured: SMTP/S + submission + IMAP/S + POP3/S + DKIM framework"
+    __success "Mail configured: SMTP/S + submission + IMAP/S + POP3/S + DKIM framework"
 }
 
 # ── FTP ───────────────────────────────────────────────────────────────────────
 __install_ftp() {
-    log "Installing ProFTPd..."
+    __log "Installing ProFTPd..."
     case "$PACKAGE_MANAGER" in
         "apt")
             # proftpd-mod-mysql is a separate package on some Debian versions but
             # may be merged into proftpd or absent on others — treat it as optional
             apt-get install -y proftpd-basic \
                 || apt-get install -y proftpd \
-                || warn "proftpd install failed — FTP may not be available"
+                || __warn "proftpd install failed — FTP may not be available"
             apt-get install -y proftpd-mod-mysql 2>/dev/null \
-                || warn "proftpd-mod-mysql unavailable — MySQL-based FTP auth disabled"
+                || __warn "proftpd-mod-mysql unavailable — MySQL-based FTP auth disabled"
             ;;
         "dnf"|"yum")
             # proftpd on EPEL 9 depends on libmemcached which is in CRB (CodeReady Builder).
@@ -970,11 +1002,11 @@ __install_ftp() {
                 || $PACKAGE_MANAGER install -y libmemcached 2>/dev/null || true
             $PACKAGE_MANAGER install -y proftpd proftpd-mysql \
                 || $PACKAGE_MANAGER install -y --nobest proftpd proftpd-mysql \
-                || warn "proftpd install failed — FTP may not be available"
+                || __warn "proftpd install failed — FTP may not be available"
             ;;
         "zypper")
             zypper install -y proftpd \
-                || warn "proftpd install failed — FTP may not be available"
+                || __warn "proftpd install failed — FTP may not be available"
             ;;
     esac
     systemctl enable proftpd 2>/dev/null || true
@@ -987,15 +1019,15 @@ __try_install() {
     local pm="$1"; shift
     for pkg in "$@"; do
         case "$pm" in
-            apt)    apt-get install -y "$pkg" 2>/dev/null || warn "Package unavailable, skipping: $pkg" ;;
-            dnf|yum) $pm install -y "$pkg" 2>/dev/null  || warn "Package unavailable, skipping: $pkg" ;;
-            zypper) zypper install -y "$pkg" 2>/dev/null || warn "Package unavailable, skipping: $pkg" ;;
+            apt)    apt-get install -y "$pkg" 2>/dev/null || __warn "Package unavailable, skipping: $pkg" ;;
+            dnf|yum) $pm install -y "$pkg" 2>/dev/null  || __warn "Package unavailable, skipping: $pkg" ;;
+            zypper) zypper install -y "$pkg" 2>/dev/null || __warn "Package unavailable, skipping: $pkg" ;;
         esac
     done
 }
 
 __install_tools() {
-    log "Installing additional tools..."
+    __log "Installing additional tools..."
     case "$PACKAGE_MANAGER" in
         "apt")
             # Core tools
@@ -1023,7 +1055,7 @@ __install_tools() {
 
 # ── fail2ban install + jails ──────────────────────────────────────────────────
 __install_fail2ban() {
-    log "Installing fail2ban..."
+    __log "Installing fail2ban..."
     case "$PACKAGE_MANAGER" in
         "apt")
             apt-get install -y fail2ban
@@ -1100,18 +1132,18 @@ FILTER_EOF
 
     systemctl enable fail2ban
     systemctl restart fail2ban
-    log "fail2ban installed and configured"
+    __log "fail2ban installed and configured"
 }
 
 # ── ISPConfig install ─────────────────────────────────────────────────────────
 __install_ispconfig() {
-    log "Downloading ISPConfig..."
+    __log "Downloading ISPConfig..."
     cd /tmp
     wget -O ispconfig.tar.gz https://www.ispconfig.org/downloads/ISPConfig-3-stable.tar.gz
     tar xfz ispconfig.tar.gz
     cd ispconfig3*/install/
 
-    log "Running ISPConfig autoinstall..."
+    __log "Running ISPConfig autoinstall..."
 
     # ISPConfig uses INI-format autoinstall files (see docs/autoinstall_samples/)
     # ispconfig_port here is the *internal* Apache port (nginx proxies ADMIN_PORT → this)
@@ -1120,10 +1152,14 @@ __install_ispconfig() {
 language=en
 install_mode=expert
 hostname=${HOSTNAME}
-mysql_hostname=localhost
+# 127.0.0.1 forces a TCP connection instead of a Unix socket — "localhost"
+# makes PHP's mysqli/PDO use its compiled-in default socket path, which can
+# mismatch MariaDB's actual socket location across the multiple PHP builds
+# this script installs, causing "Unable to connect ... No such file or directory".
+mysql_hostname=127.0.0.1
 mysql_port=3306
 mysql_root_user=root
-mysql_root_password=${MYSQL_ROOT_PASSWORD}
+mysql_root_password=${ISPCONFIG_MYSQL_ROOT_PASSWORD}
 mysql_database=dbispconfig
 mysql_charset=utf8mb4
 http_server=apache
@@ -1162,12 +1198,17 @@ EOF
     local php_bin
     php_bin=$(command -v php 2>/dev/null)
     if [[ -z "$php_bin" ]]; then
-        php_bin=$(ls /usr/bin/php[0-9]* /usr/local/bin/php[0-9]* 2>/dev/null | grep -v cgi | sort -V | tail -1)
+        local php_candidates=()
+        local f
+        for f in /usr/bin/php[0-9]* /usr/local/bin/php[0-9]*; do
+            [[ -e "$f" && "$f" != *cgi* ]] && php_candidates+=("$f")
+        done
+        ((${#php_candidates[@]} > 0)) && php_bin=$(printf '%s\n' "${php_candidates[@]}" | sort -V | tail -1)
     fi
     if [[ -z "$php_bin" ]]; then
-        error "No PHP binary found — PHP installation must have failed. Check logs above."
+        __error "No PHP binary found — PHP installation must have failed. Check logs above."
     fi
-    log "Using PHP: $(${php_bin} -r 'echo PHP_VERSION;' 2>/dev/null)"
+    __log "Using PHP: $(${php_bin} -r 'echo PHP_VERSION;' 2>/dev/null)"
 
     ${php_bin} install.php --autoinstall=/tmp/ispconfig_autoinstall.ini
     rm -f /tmp/ispconfig_autoinstall.ini
@@ -1175,7 +1216,7 @@ EOF
 
 # ── Apache backend hardening (runs after ISPConfig install) ──────────────────
 __configure_apache_backend() {
-    log "Reconfiguring Apache as reverse-proxy backend..."
+    __log "Reconfiguring Apache as reverse-proxy backend..."
 
     case "$DISTRO" in
         "ubuntu"|"debian")
@@ -1250,7 +1291,7 @@ FWDEOF
                 php_ver_dir=$(dirname "$(readlink -f "$php_cgi_bin")" 2>/dev/null | sed 's|/bin$||')
                 # Extract version from binary name (php-cgi does not support -r; use path parsing)
                 local php_ver
-                php_ver=$(basename "$php_cgi_bin" | grep -oE '[0-9]+\.[0-9]+' | head -1)
+                php_ver=$(printf '%s' "${php_cgi_bin##*/}" | grep -oE -- '[0-9]+\.[0-9]+' | head -1)
                 # Fallback: ask the CLI binary if path parsing yields nothing
                 [[ -z "$php_ver" ]] && php_ver=$(command -v "php${PHP_DEFAULT}" >/dev/null 2>&1 && \
                     "php${PHP_DEFAULT}" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null) || true
@@ -1273,7 +1314,8 @@ FWDEOF
             systemctl restart apache2
             ;;
 
-        *)  # RHEL-family and openSUSE
+        # RHEL-family and openSUSE
+        *)
             # Switch to Event MPM
             if [[ -f /etc/httpd/conf.modules.d/00-mpm.conf ]]; then
                 cat > /etc/httpd/conf.modules.d/00-mpm.conf << 'MPMEOF'
@@ -1288,15 +1330,15 @@ MPMEOF
             # Discover actual ports from the generated vhost files so we listen on
             # the right ports regardless of ISPConfig version defaults.
             local ispc_admin_port ispc_apps_port
-            ispc_admin_port=$(grep -h "^[[:space:]]*Listen[[:space:]]" \
+            ispc_admin_port=$(grep -h -- "^[[:space:]]*Listen[[:space:]]" \
                 "${APACHE_CONF_DIR}/conf/sites-available/ispconfig.vhost" 2>/dev/null | \
                 awk '{print $2}' | head -1)
-            ispc_apps_port=$(grep -h "^[[:space:]]*Listen[[:space:]]" \
+            ispc_apps_port=$(grep -h -- "^[[:space:]]*Listen[[:space:]]" \
                 "${APACHE_CONF_DIR}/conf/sites-available/apps.vhost" 2>/dev/null | \
                 awk '{print $2}' | head -1)
             [[ -n "$ispc_admin_port" ]] && APACHE_ADMIN_PORT="$ispc_admin_port"
             [[ -n "$ispc_apps_port"  ]] && APACHE_APPS_PORT="$ispc_apps_port"
-            log "ISPConfig panel port: ${APACHE_ADMIN_PORT}, apps port: ${APACHE_APPS_PORT}"
+            __log "ISPConfig panel port: ${APACHE_ADMIN_PORT}, apps port: ${APACHE_APPS_PORT}"
 
             # Replace ALL Listen directives in httpd.conf with our loopback-only set.
             # ISPConfig's vhost files also carry their own Listen lines which we
@@ -1388,7 +1430,7 @@ RIPEOF
                         "$starter" > "$_tmp" && cp "$_tmp" "$starter"
                     chattr +i "$starter" 2>/dev/null || true
                     rm -f "$_tmp"
-                    log "Patched ${starter} → ${rhel_php_cgi}"
+                    __log "Patched ${starter} → ${rhel_php_cgi}"
                 done
             fi
 
@@ -1396,12 +1438,12 @@ RIPEOF
             ;;
     esac
 
-    success "Apache reconfigured: backend on ${APACHE_BACKEND_IP}:${APACHE_BACKEND_PORT} / admin on ${APACHE_BACKEND_IP}:${APACHE_ADMIN_PORT}"
+    __success "Apache reconfigured: backend on ${APACHE_BACKEND_IP}:${APACHE_BACKEND_PORT} / admin on ${APACHE_BACKEND_IP}:${APACHE_ADMIN_PORT}"
 }
 
 # ── ISPConfig + Nginx wiring ──────────────────────────────────────────────────
 __configure_ispconfig_nginx() {
-    log "Wiring ISPConfig to Nginx reverse proxy..."
+    __log "Wiring ISPConfig to Nginx reverse proxy..."
 
     local ISPC_CONF="/usr/local/ispconfig/server/conf"
     local ISPC_CONF_CUSTOM="/usr/local/ispconfig/server/conf-custom"
@@ -1422,7 +1464,7 @@ __configure_ispconfig_nginx() {
                 -e '/SSLCertificateChainFile/d' \
                 "$tpl"
         done
-        log "ISPConfig Apache templates patched"
+        __log "ISPConfig Apache templates patched"
     fi
 
     # nginx vhost for ISPConfig admin panel (port ADMIN_PORT → Apache admin port)
@@ -1457,7 +1499,8 @@ APACHE_BACKEND="127.0.0.1:81"
 changed=0
 
 for cert_dir in /etc/letsencrypt/live/*/; do
-    domain=$(basename "$cert_dir")
+    domain="${cert_dir%/}"
+    domain="${domain##*/}"
     vhost_file="${VHOSTS_DIR}/${domain}.conf"
     fullchain="${cert_dir}fullchain.pem"
     privkey="${cert_dir}privkey.pem"
@@ -1486,7 +1529,7 @@ for cert_dir in /etc/letsencrypt/live/*/; do
 }"
 
     existing_content=""
-    [[ -f "$vhost_file" ]] && existing_content=$(cat "$vhost_file")
+    [[ -f "$vhost_file" ]] && existing_content=$(< "$vhost_file")
     if [[ "$new_content" != "$existing_content" ]]; then
         echo "$new_content" > "$vhost_file"
         changed=1
@@ -1504,15 +1547,15 @@ SYNCEOF
     ln -sf /usr/local/bin/ispconfig-nginx-sync \
         /etc/letsencrypt/renewal-hooks/deploy/99-ispconfig-nginx-sync
 
-    log "nginx-sync helper installed at /usr/local/bin/ispconfig-nginx-sync"
+    __log "nginx-sync helper installed at /usr/local/bin/ispconfig-nginx-sync"
 }
 
 # ── SSL / certs ───────────────────────────────────────────────────────────────
 __configure_ssl() {
-    log "Generating SSL assets for Nginx..."
+    __log "Generating SSL assets for Nginx..."
     mkdir -p "$SSL_DIR"
 
-    log "Generating DH parameters (2048-bit, takes ~30s)..."
+    __log "Generating DH parameters (2048-bit, takes ~30s)..."
     openssl dhparam -out /etc/nginx/dhparam.pem 2048
 
     # Default nginx catch-all cert
@@ -1537,12 +1580,12 @@ __configure_ssl() {
     fi
 
     chmod 640 "${SSL_DIR}"/*.key 2>/dev/null || true
-    success "SSL assets generated in ${SSL_DIR}"
+    __success "SSL assets generated in ${SSL_DIR}"
 }
 
 # ── Final configuration ───────────────────────────────────────────────────────
 __final_configuration() {
-    log "Performing final configuration..."
+    __log "Performing final configuration..."
 
     # Log rotation for ISPConfig
     cat > /etc/logrotate.d/ispconfig << 'EOF'
@@ -1640,7 +1683,7 @@ Credentials:
   ISPConfig password: ${ISPCONFIG_ADMIN_PASSWORD}
 
   MySQL root user:    root
-  MySQL root pass:    ${MYSQL_ROOT_PASSWORD}
+  MySQL root pass:    ${ISPCONFIG_MYSQL_ROOT_PASSWORD}
 
   ISPConfig DB user:  ispconfig
   ISPConfig DB pass:  ${ISPCONFIG_DB_PASSWORD}
@@ -1700,11 +1743,11 @@ Next steps:
   7. Remove /var/www/html/phpinfo.php before going live
 EOF
 
-    log "Summary saved to /root/ispconfig_installation_summary.txt"
+    __log "Summary saved to /root/ispconfig_installation_summary.txt"
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-main() {
+__main() {
     echo -e "${PURPLE}"
     echo "============================================"
     echo "  ISPConfig — Nginx Reverse Proxy Installer"
@@ -1740,21 +1783,21 @@ main() {
     __create_summary
 
     echo -e "${GREEN}"
-    log "============================================"
-    log "Installation complete!"
-    log "============================================"
+    __log "============================================"
+    __log "Installation complete!"
+    __log "============================================"
     echo -e "${NC}"
     local server_ip
     server_ip=$(hostname -I | awk '{print $1}')
-    log "ISPConfig panel:    https://${server_ip}:${ADMIN_PORT}"
-    log "ISPConfig username: admin"
-    log "ISPConfig password: ${ISPCONFIG_ADMIN_PASSWORD}"
-    log "MySQL root user:    root"
-    log "MySQL root pass:    ${MYSQL_ROOT_PASSWORD}"
-    log "ISPConfig DB user:  ispconfig"
-    log "ISPConfig DB pass:  ${ISPCONFIG_DB_PASSWORD}"
-    warn "Credentials saved to: /root/ispconfig_installation_summary.txt"
+    __log "ISPConfig panel:    https://${server_ip}:${ADMIN_PORT}"
+    __log "ISPConfig username: admin"
+    __log "ISPConfig password: ${ISPCONFIG_ADMIN_PASSWORD}"
+    __log "MySQL root user:    root"
+    __log "MySQL root pass:    ${ISPCONFIG_MYSQL_ROOT_PASSWORD}"
+    __log "ISPConfig DB user:  ispconfig"
+    __log "ISPConfig DB pass:  ${ISPCONFIG_DB_PASSWORD}"
+    __warn "Credentials saved to: /root/ispconfig_installation_summary.txt"
     echo -e "${NC}"
 }
 
-main "$@"
+__main "$@"
