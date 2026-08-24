@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202608241647-git
+##@Version           :  202608241652-git
 # @@Author           :  ISPConfig Universal Installer Contributors
 # @@Contact          :  https://github.com/scriptmgr/ispconfig
 # @@License          :  MIT
@@ -10,7 +10,7 @@
 # @@Created          :  Monday, August 24, 2026 15:34 EDT
 # @@File             :  install.sh
 # @@Description      :  Universal distro-agnostic ISPConfig installer with Nginx reverse proxy, multi-PHP, and full mail stack
-# @@Changelog        :  Fix MySQL TCP connection for ISPConfig autoinstall; resolve script-lint violations; quiet install-step output with spinner and __failed() error capture; clear-to-EOL fix for spinner/status line garbling
+# @@Changelog        :  Fix MySQL TCP connection for ISPConfig autoinstall; resolve script-lint violations; quiet install-step output with spinner and __failed() error capture; clear-to-EOL fix for spinner/status line garbling; warn when running over SSH without tmux/screen before the system-upgrade step
 # @@TODO             :  none
 # @@Other            :  none
 # @@Resource         :  https://www.ispconfig.org/
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202608241647-git"
+VERSION="202608241652-git"
 
 # Universal ISPConfig Installation Script
 # Architecture: Nginx (frontend, SSL termination) → Apache (backend, 127.0.0.1:81)
@@ -131,6 +131,17 @@ __step() {
 __check_root() {
     if [[ $EUID -ne 0 ]]; then
         __error "This script must be run as root"
+    fi
+}
+
+# __update_system runs a full system upgrade, which can restart sshd/systemd/
+# dbus (directly, or via an auto-restart hook like needrestart) and kill the
+# very SSH session running this script. Warn up front — non-blocking — when
+# connected over SSH without a terminal multiplexer to survive that.
+__check_session_safety() {
+    if [[ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" && -z "${TMUX:-}${STY:-}" ]]; then
+        __warn "Running over SSH without tmux/screen. The system-update step can restart sshd/systemd and drop this session mid-install."
+        __warn "Recommended: re-run inside 'tmux new -s ispconfig' or 'screen -S ispconfig'."
     fi
 }
 
@@ -1809,6 +1820,7 @@ __main() {
     echo -e "${NC}"
 
     __check_root
+    __check_session_safety
     __detect_distro
     __generate_passwords
     __set_hostname

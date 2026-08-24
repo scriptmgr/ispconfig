@@ -17,6 +17,8 @@ The script must be run as root. It detects your distribution automatically and r
 
 Output is one line per install step (with a spinner while it runs) — package-manager noise is captured, not streamed. A step that fails prints `[FAILED]` plus the last 40 lines of its captured log and stops the script.
 
+**If you're connecting over SSH, run it inside `tmux`/`screen`.** The first step is a full system upgrade, which can restart `sshd`/`systemd`/`dbus` (directly or via an auto-restart hook like `needrestart`) and kill the SSH session running the script — a terminal multiplexer survives that. The script warns if it detects SSH without one, but running inside `tmux new -s ispconfig` or `screen -S ispconfig` up front avoids the interruption entirely.
+
 ---
 
 ## ✨ Features
