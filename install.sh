@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202608241603-git
+##@Version           :  202608241647-git
 # @@Author           :  ISPConfig Universal Installer Contributors
 # @@Contact          :  https://github.com/scriptmgr/ispconfig
 # @@License          :  MIT
@@ -10,7 +10,7 @@
 # @@Created          :  Monday, August 24, 2026 15:34 EDT
 # @@File             :  install.sh
 # @@Description      :  Universal distro-agnostic ISPConfig installer with Nginx reverse proxy, multi-PHP, and full mail stack
-# @@Changelog        :  Fix MySQL TCP connection for ISPConfig autoinstall; resolve script-lint violations; quiet install-step output with spinner and __failed() error capture
+# @@Changelog        :  Fix MySQL TCP connection for ISPConfig autoinstall; resolve script-lint violations; quiet install-step output with spinner and __failed() error capture; clear-to-EOL fix for spinner/status line garbling
 # @@TODO             :  none
 # @@Other            :  none
 # @@Resource         :  https://www.ispconfig.org/
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202608241603-git"
+VERSION="202608241647-git"
 
 # Universal ISPConfig Installation Script
 # Architecture: Nginx (frontend, SSL termination) → Apache (backend, 127.0.0.1:81)
@@ -35,6 +35,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 NC='\033[0m'
+CLR_EOL='\033[K'
 
 # ── Global variables ──────────────────────────────────────────────────────────
 ADMIN_PORT=64245
@@ -78,7 +79,7 @@ __success() { echo -e "${BLUE}[SUCCESS]${NC} $1"; }
 # success and only surfaces when something actually breaks.
 __failed() {
     local desc="$1" logfile="$2" rc="${3:-1}"
-    printf "\r%s ${RED}[FAILED]${NC}\n" "$desc"
+    printf "\r%s ${RED}[FAILED]${NC}${CLR_EOL}\n" "$desc"
     if [[ -n "$logfile" && -s "$logfile" ]]; then
         echo -e "${RED}--- last 40 lines of output (${logfile}) ---${NC}"
         tail -n 40 "$logfile"
@@ -91,7 +92,7 @@ __spin() {
     local desc="$1" frames='|/-\' i=0
     while :; do
         i=$(( (i + 1) % 4 ))
-        printf "\r%s %s" "$desc" "${frames:$i:1}"
+        printf "\r%s %s${CLR_EOL}" "$desc" "${frames:$i:1}"
         sleep 0.2
     done
 }
@@ -119,7 +120,7 @@ __step() {
         wait "$spin_pid" 2>/dev/null
     fi
     if [[ $rc -eq 0 ]]; then
-        printf "\r%s ${GREEN}[OK]${NC}\n" "$desc"
+        printf "\r%s ${GREEN}[OK]${NC}${CLR_EOL}\n" "$desc"
         rm -f "$logfile"
     else
         __failed "$desc" "$logfile" "$rc"
