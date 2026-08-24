@@ -2,15 +2,34 @@
 
 A comprehensive, distro-agnostic installation script for ISPConfig hosting control panel. Installs a full LEMP/LAMP stack with Nginx as the SSL-terminating reverse proxy in front of Apache, multiple co-installable PHP versions, and a complete mail stack — fully automated with zero interactive prompts.
 
+---
+
+## 📦 Install
+
+```bash
+# Download and review first (recommended)
+wget https://raw.githubusercontent.com/scriptmgr/ispconfig/main/install.sh
+chmod +x install.sh
+bash install.sh
+```
+
+The script must be run as root. It detects your distribution automatically and requires no configuration.
+
+Output is one line per install step (with a spinner while it runs) — package-manager noise is captured, not streamed. A step that fails prints `[FAILED]` plus the last 40 lines of its captured log and stops the script.
+
+---
+
 ## ✨ Features
 
 - **🌍 Universal compatibility** — works across all major Linux distributions
-- **🐘 Multiple PHP versions** — installs PHP 5.6 through 8.4 with full extension support
+- **🐘 Multiple PHP versions** — installs PHP 5.6 through 8.5 with full extension support
 - **🔀 Nginx + Apache architecture** — Nginx handles SSL termination and static assets; Apache runs PHP on a loopback backend port
 - **🔧 Fully automated** — no interactive prompts; generates all passwords at runtime
 - **🛡️ Security first** — firewall rules, TLS 1.2/1.3 only, HSTS, DH params, OCSP stapling
 - **📧 Production mail stack** — Postfix + Dovecot + OpenDKIM with submission and SMTPS ports
 - **⚡ Production ready** — Event MPM, RemoteIP passthrough, PHP-FPM pools, logrotate
+
+---
 
 ## 📋 Supported Distributions
 
@@ -29,16 +48,7 @@ A comprehensive, distro-agnostic installation script for ISPConfig hosting contr
 
 > **Ubuntu 25.x / 26.04 note:** These releases are detected and partially supported. The Ondrej PHP PPA does not yet carry packages for these codenames, so only the PHP version shipped natively by Ubuntu (8.5 on 26.04) is installed. Ubuntu 26.04 ships Dovecot 2.4, which has a breaking configuration format change (new `dovecot_config_version` header required, renamed settings, `passdb`/`userdb` block syntax change); full Dovecot 2.4 support is pending.
 
-## 🚀 Quick Start
-
-```bash
-# Download and review first (recommended)
-wget https://raw.githubusercontent.com/scriptmgr/ispconfig/main/install.sh
-chmod +x install.sh
-bash install.sh
-```
-
-The script must be run as root. It detects your distribution automatically and requires no configuration.
+---
 
 ## 🏗️ Architecture
 
@@ -53,6 +63,8 @@ Nginx :64245     → TLS termination → Apache 127.0.0.1:7080 (ISPConfig panel)
 
 Apache listens only on loopback. All TLS, HSTS, and caching are handled by Nginx. PHP runs via FPM pools. ISPConfig manages Apache vhost templates and DNS; Nginx picks up Let's Encrypt certificates automatically via a deploy hook.
 
+---
+
 ## ⚙️ What Gets Installed
 
 | Component | Software |
@@ -60,7 +72,7 @@ Apache listens only on loopback. All TLS, HSTS, and caching are handled by Nginx
 | Frontend proxy | Nginx (Event, SSL, gzip, open-file-cache) |
 | Web backend | Apache (Event MPM, mod-fcgid, RemoteIP) |
 | Database | MariaDB (secured, root password in `/root/.my.cnf`) |
-| PHP | 5.6, 7.0, 7.1, 7.2, 7.3, 7.4, 8.0, 8.1, 8.2, 8.3, 8.4 with FPM |
+| PHP | 5.6, 7.0, 7.1, 7.2, 7.3, 7.4, 8.0, 8.1, 8.2, 8.3, 8.4, 8.5 with FPM |
 | Mail | Postfix + Dovecot + OpenDKIM (ports 25, 465, 587, 143, 993, 110, 995) |
 | FTP | ProFTPd with MySQL authentication |
 | DNS | BIND9 / named |
@@ -71,6 +83,8 @@ Apache listens only on loopback. All TLS, HSTS, and caching are handled by Nginx
 | SSL | Self-signed certs at install; Let's Encrypt via certbot + auto-sync hook |
 
 PHP extensions installed per version: `mysql`, `pgsql`, `sqlite3`, `gd`, `imagick`, `mbstring`, `xml`, `curl`, `zip`, `soap`, `intl`, `bcmath`, `opcache`, `readline`, `bz2`, `xsl`, `tidy`, `ldap`, `imap`, `gettext`, `exif`, `sockets`, `redis`, `memcached`.
+
+---
 
 ## 📖 Post-Installation
 
@@ -104,6 +118,8 @@ certbot certonly --webroot -w /var/www/letsencrypt -d example.com -d www.example
 
 Visit `http://<server-ip>/phpinfo.php` — lists all installed PHP versions and confirms `X-Forwarded-Proto` passthrough. **Remove before going live.**
 
+---
+
 ## 📁 Key Paths
 
 | Path | Purpose |
@@ -134,6 +150,8 @@ EOF
 nginx -t && systemctl reload nginx
 ```
 
+---
+
 ## 🛡️ DKIM / SPF / DMARC
 
 OpenDKIM is installed and wired into Postfix. Keys are generated per-domain through the ISPConfig UI (DNS → Zones → DKIM).
@@ -152,6 +170,8 @@ _dmarc.example.com  TXT  "v=DMARC1; p=quarantine; rua=mailto:admin@example.com"
 ```
 
 Also set a **PTR record** (reverse DNS) for your server IP → `<hostname>` with your VPS provider.
+
+---
 
 ## 🔧 Service Management
 
@@ -182,6 +202,8 @@ systemctl restart proftpd
 systemctl restart mariadb
 ```
 
+---
+
 ## 🐛 Troubleshooting
 
 **Cannot reach the ISPConfig panel**
@@ -210,6 +232,11 @@ postconf smtpd_milters              # verify OpenDKIM is wired in
 nginx -t
 ```
 
+**A step reports `[FAILED]`**
+The captured log tail printed with the failure shows the actual package-manager or config error — scroll up in the terminal to see it; nothing else is hidden.
+
+---
+
 ## 📊 System Requirements
 
 | | Minimum | Recommended |
@@ -221,6 +248,8 @@ nginx -t
 
 Root access is required.
 
+---
+
 ## ⚠️ Security Notes
 
 - All passwords are randomly generated at install time and saved to `/root/ispconfig_installation_summary.txt` — secure this file
@@ -228,6 +257,8 @@ Root access is required.
 - Remove `/var/www/html/phpinfo.php` before going live
 - Review opened firewall ports and close any not needed for your use case
 - Set a PTR record (reverse DNS) for your IP — required for reliable mail delivery
+
+---
 
 ## 🤝 Contributing
 
@@ -237,12 +268,16 @@ Issues and pull requests are welcome on [GitHub](https://github.com/scriptmgr/is
 - Relevant lines from the install log
 - Expected vs actual behaviour
 
-## 📜 License
-
-MIT — see [LICENSE.md](LICENSE.md).
+---
 
 ## 🙏 Acknowledgments
 
 - [ISPConfig](https://www.ispconfig.org/) — the hosting control panel this script deploys
 - [Ondřej Surý](https://launchpad.net/~ondrej/+archive/ubuntu/php) — PHP packages for Debian/Ubuntu
 - [Remi Collet](https://rpms.remirepo.net/) — PHP packages for RHEL-family systems
+
+---
+
+## 📜 License
+
+MIT — see [LICENSE.md](LICENSE.md).
