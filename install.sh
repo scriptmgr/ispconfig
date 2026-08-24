@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202608241544-git
+##@Version           :  202608241603-git
 # @@Author           :  ISPConfig Universal Installer Contributors
 # @@Contact          :  https://github.com/scriptmgr/ispconfig
 # @@License          :  MIT
@@ -10,7 +10,7 @@
 # @@Created          :  Monday, August 24, 2026 15:34 EDT
 # @@File             :  install.sh
 # @@Description      :  Universal distro-agnostic ISPConfig installer with Nginx reverse proxy, multi-PHP, and full mail stack
-# @@Changelog        :  Fix MySQL TCP connection for ISPConfig autoinstall; resolve script-lint violations
+# @@Changelog        :  Fix MySQL TCP connection for ISPConfig autoinstall; resolve script-lint violations; quiet install-step output with spinner and __failed() error capture
 # @@TODO             :  none
 # @@Other            :  none
 # @@Resource         :  https://www.ispconfig.org/
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202608241544-git"
+VERSION="202608241603-git"
 
 # Universal ISPConfig Installation Script
 # Architecture: Nginx (frontend, SSL termination) → Apache (backend, 127.0.0.1:81)
@@ -72,6 +72,59 @@ __log()     { echo -e "${GREEN}[INFO]${NC} $1"; }
 __warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
 __error()   { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 __success() { echo -e "${BLUE}[SUCCESS]${NC} $1"; }
+
+# Prints the failure marker plus the tail of a captured step log, then exits.
+# Used by __step on a non-zero exit so package-manager noise stays hidden on
+# success and only surfaces when something actually breaks.
+__failed() {
+    local desc="$1" logfile="$2" rc="${3:-1}"
+    printf "\r%s ${RED}[FAILED]${NC}\n" "$desc"
+    if [[ -n "$logfile" && -s "$logfile" ]]; then
+        echo -e "${RED}--- last 40 lines of output (${logfile}) ---${NC}"
+        tail -n 40 "$logfile"
+    fi
+    exit "$rc"
+}
+
+# Simple ASCII spinner; runs as a background job and is killed by __step.
+__spin() {
+    local desc="$1" frames='|/-\' i=0
+    while :; do
+        i=$(( (i + 1) % 4 ))
+        printf "\r%s %s" "$desc" "${frames:$i:1}"
+        sleep 0.2
+    done
+}
+
+# Runs a function quietly: stdout/stderr are captured to a temp log instead
+# of streaming to the terminal, a spinner shows progress, and the result
+# collapses to one line — "[OK]" on success, or __failed's report on failure.
+__step() {
+    local desc="$1"; shift
+    local logfile spin_pid rc
+    logfile=$(mktemp /tmp/ispconfig-install.XXXXXX.log)
+    if [[ -t 1 ]]; then
+        __spin "$desc" &
+        spin_pid=$!
+    fi
+    trap 'ec=$?; [[ -n "${spin_pid:-}" ]] && kill "$spin_pid" 2>/dev/null; __failed "$desc" "$logfile" "$ec"' EXIT
+    if { "$@"; } >"$logfile" 2>&1; then
+        rc=0
+    else
+        rc=$?
+    fi
+    trap - EXIT
+    if [[ -n "${spin_pid:-}" ]]; then
+        kill "$spin_pid" 2>/dev/null
+        wait "$spin_pid" 2>/dev/null
+    fi
+    if [[ $rc -eq 0 ]]; then
+        printf "\r%s ${GREEN}[OK]${NC}\n" "$desc"
+        rm -f "$logfile"
+    else
+        __failed "$desc" "$logfile" "$rc"
+    fi
+}
 
 # ── Root check ────────────────────────────────────────────────────────────────
 __check_root() {
@@ -1759,27 +1812,27 @@ __main() {
     __generate_passwords
     __set_hostname
 
-    __update_system
-    __install_base_packages
-    __configure_firewall
+    __step "Updating system packages"          __update_system
+    __step "Installing base packages"          __install_base_packages
+    __step "Configuring firewall"              __configure_firewall
 
-    __install_nginx
-    __install_apache
-    __install_mysql
-    __install_php
-    __install_mail
-    __install_ftp
-    __install_tools
-    __install_fail2ban
+    __step "Installing Nginx"                  __install_nginx
+    __step "Installing Apache"                 __install_apache
+    __step "Installing MySQL/MariaDB"          __install_mysql
+    __step "Installing PHP versions"           __install_php
+    __step "Installing mail stack"             __install_mail
+    __step "Installing FTP server"             __install_ftp
+    __step "Installing tools"                  __install_tools
+    __step "Installing fail2ban"               __install_fail2ban
 
-    __install_ispconfig
+    __step "Installing ISPConfig"              __install_ispconfig
 
-    __configure_apache_backend
-    __configure_ispconfig_nginx
-    __configure_mail_public
-    __configure_ssl
+    __step "Configuring Apache backend"        __configure_apache_backend
+    __step "Configuring Nginx for ISPConfig"   __configure_ispconfig_nginx
+    __step "Configuring public mail records"   __configure_mail_public
+    __step "Configuring SSL"                   __configure_ssl
 
-    __final_configuration
+    __step "Finalizing configuration"          __final_configuration
     __create_summary
 
     echo -e "${GREEN}"
