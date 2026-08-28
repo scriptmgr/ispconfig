@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202608241652-git
+##@Version           :  202608272122-git
 # @@Author           :  ISPConfig Universal Installer Contributors
 # @@Contact          :  https://github.com/scriptmgr/ispconfig
 # @@License          :  MIT
@@ -10,7 +10,7 @@
 # @@Created          :  Monday, August 24, 2026 15:34 EDT
 # @@File             :  install.sh
 # @@Description      :  Universal distro-agnostic ISPConfig installer with Nginx reverse proxy, multi-PHP, and full mail stack
-# @@Changelog        :  Fix MySQL TCP connection for ISPConfig autoinstall; resolve script-lint violations; quiet install-step output with spinner and __failed() error capture; clear-to-EOL fix for spinner/status line garbling; warn when running over SSH without tmux/screen before the system-upgrade step
+# @@Changelog        :  See git log for full history; latest: load mod_suexec on RHEL/Debian/Ubuntu, give openSUSE its own apache-backend branch
 # @@TODO             :  none
 # @@Other            :  none
 # @@Resource         :  https://www.ispconfig.org/
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202608241652-git"
+VERSION="202608272122-git"
 
 # Universal ISPConfig Installation Script
 # Architecture: Nginx (frontend, SSL termination) → Apache (backend, 127.0.0.1:81)
@@ -116,8 +116,8 @@ __step() {
     fi
     trap - EXIT
     if [[ -n "${spin_pid:-}" ]]; then
-        kill "$spin_pid" 2>/dev/null
-        wait "$spin_pid" 2>/dev/null
+        kill "$spin_pid" 2>/dev/null || true
+        wait "$spin_pid" 2>/dev/null || true
     fi
     if [[ $rc -eq 0 ]]; then
         printf "\r%s ${GREEN}[OK]${NC}${CLR_EOL}\n" "$desc"
@@ -1289,6 +1289,12 @@ __configure_apache_backend() {
             a2dismod mpm_prefork mpm_worker 2>/dev/null || true
             a2enmod  mpm_event remoteip
 
+            # ISPConfig's apps.vhost uses SuexecUserGroup under mod_fcgid — the
+            # module ships disabled by default (matches casjay-base/debian and
+            # /ubuntu mods-available/suexec.load); without enabling it, Apache
+            # fails to start entirely (502 from nginx in front).
+            a2enmod suexec 2>/dev/null || true
+
             # Tune Event MPM
             cat > /etc/apache2/mods-available/mpm_event.conf << 'MPMEOF'
 <IfModule mpm_event_module>
@@ -1379,7 +1385,99 @@ FWDEOF
             systemctl restart apache2
             ;;
 
-        # RHEL-family and openSUSE
+        "opensuse"|"opensuse-leap"|"sles")
+            # openSUSE/SLES apache2 has no conf.modules.d and no sites-available/
+            # sites-enabled split — modules are toggled with a2enmod/a2dismod
+            # (like Debian) but the main config lives directly at
+            # ${APACHE_CONF_DIR}/httpd.conf (no "conf" subdirectory, unlike RHEL),
+            # and ISPConfig's SuSE installer writes vhosts flat into
+            # ${APACHE_VHOST_DIR} (/etc/apache2/vhosts.d), auto-included via a
+            # wildcard Include in httpd.conf. This branch was previously falling
+            # through to the RHEL `*)` case, which used RHEL-only paths and
+            # silently no-op'd on this distro.
+            a2dismod mpm_prefork mpm_worker 2>/dev/null || true
+            a2enmod  mpm_event remoteip
+
+            # ISPConfig's apps.vhost uses SuexecUserGroup under mod_fcgid. SUSE
+            # docs claim mod_suexec ships enabled by default, but that hasn't
+            # been verified against this script's target images — enable it
+            # idempotently via a2enmod so the fix holds either way.
+            a2enmod suexec 2>/dev/null || true
+
+            # ISPConfig writes its panel port from autoinstall.ini (ispconfig_port)
+            # but the apps port is hardcoded by ISPConfig (panel_port is NOT +1).
+            # Discover actual ports from the generated vhost files so we listen on
+            # the right ports regardless of ISPConfig version defaults.
+            local suse_admin_port suse_apps_port
+            suse_admin_port=$(grep -h -- "^[[:space:]]*Listen[[:space:]]" \
+                "${APACHE_VHOST_DIR}/ispconfig.vhost" 2>/dev/null | \
+                awk '{print $2}' | head -1)
+            suse_apps_port=$(grep -h -- "^[[:space:]]*Listen[[:space:]]" \
+                "${APACHE_VHOST_DIR}/apps.vhost" 2>/dev/null | \
+                awk '{print $2}' | head -1)
+            [[ -n "$suse_admin_port" ]] && APACHE_ADMIN_PORT="$suse_admin_port"
+            [[ -n "$suse_apps_port"  ]] && APACHE_APPS_PORT="$suse_apps_port"
+            __log "ISPConfig panel port: ${APACHE_ADMIN_PORT}, apps port: ${APACHE_APPS_PORT}"
+
+            # Replace ALL Listen directives in httpd.conf with our loopback-only set.
+            sed -i '/^[[:space:]]*Listen /d' "${APACHE_CONF_DIR}/httpd.conf"
+            cat >> "${APACHE_CONF_DIR}/httpd.conf" << LISTENEOF
+
+# Backend ports — loopback only (nginx terminates TLS externally)
+Listen ${APACHE_BACKEND_IP}:${APACHE_BACKEND_PORT}
+Listen ${APACHE_BACKEND_IP}:${APACHE_ADMIN_PORT}
+Listen ${APACHE_BACKEND_IP}:${APACHE_APPS_PORT}
+LISTENEOF
+
+            # Event MPM tuning
+            cat >> "${APACHE_CONF_DIR}/httpd.conf" << 'MPMTUNEEOF'
+
+<IfModule mpm_event_module>
+    StartServers              4
+    MinSpareThreads          25
+    MaxSpareThreads          75
+    ThreadLimit              64
+    ThreadsPerChild          25
+    MaxRequestWorkers       400
+    MaxConnectionsPerChild 10000
+</IfModule>
+MPMTUNEEOF
+
+            # RemoteIP + HTTPS passthrough — conf.d/*.conf is wildcard-included
+            # by default on SUSE (no a2enconf equivalent exists there).
+            cat > "${APACHE_CONF_EXTRA}/remoteip.conf" << 'RIPEOF'
+RemoteIPHeader X-Forwarded-For
+RemoteIPInternalProxy 127.0.0.1
+RemoteIPInternalProxy ::1
+SetEnvIf X-Forwarded-Proto https HTTPS=on
+SetEnvIf X-Forwarded-Proto https REQUEST_SCHEME=https
+RIPEOF
+
+            # Patch ALL vhost files in the flat vhosts.d directory: keep port
+            # numbers but restrict to loopback IP; strip Listen/NameVirtualHost
+            # lines (httpd.conf is now the single listener authority).
+            for f in "${APACHE_VHOST_DIR}"/*.conf "${APACHE_VHOST_DIR}"/*.vhost; do
+                [[ -f "$f" ]] || continue
+                sed -i \
+                    -e "s|<VirtualHost \*:\([0-9]*\)>|<VirtualHost ${APACHE_BACKEND_IP}:\1>|g" \
+                    -e "s|<VirtualHost _default_:\([0-9]*\)>|<VirtualHost ${APACHE_BACKEND_IP}:\1>|g" \
+                    -e '/^[[:space:]]*Listen /d' \
+                    -e '/^[[:space:]]*NameVirtualHost/d' \
+                    -e '/SSLEngine [Oo]n/d' \
+                    -e '/SSLCertificateFile/d' \
+                    -e '/SSLCertificateKeyFile/d' \
+                    -e '/SSLCertificateChainFile/d' \
+                    -e '/SSLCACertificateFile/d' \
+                    -e '/SSLProtocol/d' \
+                    -e '/SSLCipherSuite/d' \
+                    -e '/SSLHonorCipherOrder/d' \
+                    "$f"
+            done
+
+            systemctl restart "${APACHE_SERVICE}"
+            ;;
+
+        # RHEL-family
         *)
             # Switch to Event MPM
             if [[ -f /etc/httpd/conf.modules.d/00-mpm.conf ]]; then
@@ -1388,6 +1486,20 @@ FWDEOF
 # LoadModule mpm_worker_module  modules/mod_mpm_worker.so
 LoadModule mpm_event_module   modules/mod_mpm_event.so
 MPMEOF
+            fi
+
+            # ISPConfig's default apps.vhost uses SuexecUserGroup under mod_fcgid,
+            # but the httpd package ships mod_suexec.so without a LoadModule line —
+            # without this, httpd fails to start entirely (502 from nginx in front).
+            # This base image's httpd.conf hand-lists every LoadModule directly
+            # (matching casjay-base/centos/etc/httpd/conf/httpd.conf) with no
+            # IncludeOptional conf.modules.d/*.conf, so a conf.modules.d drop-in
+            # is silently ignored — insert the line into httpd.conf itself,
+            # right after the existing fcgid_module line it's always paired with.
+            if [[ -f /etc/httpd/modules/mod_suexec.so ]] \
+                && ! grep -q -- "^[[:space:]]*LoadModule[[:space:]]\+suexec_module" "${APACHE_CONF_DIR}/conf/httpd.conf"; then
+                sed -i '/^LoadModule fcgid_module /a LoadModule suexec_module modules/mod_suexec.so' \
+                    "${APACHE_CONF_DIR}/conf/httpd.conf"
             fi
 
             # ISPConfig writes its panel port from autoinstall.ini (ispconfig_port)
