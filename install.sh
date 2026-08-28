@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202608272122-git
+##@Version           :  202608272305-git
 # @@Author           :  ISPConfig Universal Installer Contributors
 # @@Contact          :  https://github.com/scriptmgr/ispconfig
 # @@License          :  MIT
@@ -10,7 +10,7 @@
 # @@Created          :  Monday, August 24, 2026 15:34 EDT
 # @@File             :  install.sh
 # @@Description      :  Universal distro-agnostic ISPConfig installer with Nginx reverse proxy, multi-PHP, and full mail stack
-# @@Changelog        :  See git log for full history; latest: load mod_suexec on RHEL/Debian/Ubuntu, give openSUSE its own apache-backend branch
+# @@Changelog        :  See git log for full history; latest: overridable ISPCONFIG_ADMIN_USER, post-install panel rename
 # @@TODO             :  none
 # @@Other            :  none
 # @@Resource         :  https://www.ispconfig.org/
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202608272122-git"
+VERSION="202608272305-git"
 
 # Universal ISPConfig Installation Script
 # Architecture: Nginx (frontend, SSL termination) → Apache (backend, 127.0.0.1:81)
@@ -41,6 +41,7 @@ CLR_EOL='\033[K'
 ADMIN_PORT=64245
 ISPCONFIG_MYSQL_ROOT_PASSWORD=""
 ISPCONFIG_ADMIN_PASSWORD=""
+ISPCONFIG_ADMIN_USER=""
 ISPCONFIG_DB_PASSWORD=""
 HOSTNAME=""
 DISTRO=""
@@ -248,6 +249,10 @@ __generate_passwords() {
         ISPCONFIG_ADMIN_PASSWORD=$(openssl rand -base64 32)
         __log "Generated ISPConfig admin password"
     fi
+    # Not a secret to generate — ISPConfig's own autoinstall.ini has no key for
+    # this (the installer always seeds the panel account as "admin"); default
+    # here just preserves that behavior when the caller doesn't override it.
+    ISPCONFIG_ADMIN_USER="${ISPCONFIG_ADMIN_USER:-admin}"
     if [[ -z "$ISPCONFIG_DB_PASSWORD" ]]; then
         ISPCONFIG_DB_PASSWORD=$(openssl rand -base64 32)
         __log "Generated ISPConfig DB user password"
@@ -1277,6 +1282,18 @@ EOF
 
     ${php_bin} install.php --autoinstall=/tmp/ispconfig_autoinstall.ini
     rm -f /tmp/ispconfig_autoinstall.ini
+
+    # ISPConfig's autoinstall.ini has no key to set the panel admin username —
+    # install.php always seeds it as "admin". Rename it in place when the
+    # caller asked for something else; sys_user.username is only ever matched
+    # by string on login, so this is safe post-install.
+    if [[ "$ISPCONFIG_ADMIN_USER" != "admin" ]]; then
+        local mysql_bin="mysql"
+        command -v mariadb >/dev/null 2>&1 && mysql_bin="mariadb"
+        "$mysql_bin" -u root -p"${ISPCONFIG_MYSQL_ROOT_PASSWORD}" dbispconfig -e \
+            "UPDATE sys_user SET username='${ISPCONFIG_ADMIN_USER}' WHERE username='admin';"
+        __log "Renamed ISPConfig admin user to '${ISPCONFIG_ADMIN_USER}'"
+    fi
 }
 
 # ── Apache backend hardening (runs after ISPConfig install) ──────────────────
@@ -1856,7 +1873,7 @@ Architecture:
 
 Credentials:
   ISPConfig panel:    https://${server_ip}:${ADMIN_PORT}
-  ISPConfig username: admin
+  ISPConfig username: ${ISPCONFIG_ADMIN_USER}
   ISPConfig password: ${ISPCONFIG_ADMIN_PASSWORD}
 
   MySQL root user:    root
@@ -1968,7 +1985,7 @@ __main() {
     local server_ip
     server_ip=$(hostname -I | awk '{print $1}')
     __log "ISPConfig panel:    https://${server_ip}:${ADMIN_PORT}"
-    __log "ISPConfig username: admin"
+    __log "ISPConfig username: ${ISPCONFIG_ADMIN_USER}"
     __log "ISPConfig password: ${ISPCONFIG_ADMIN_PASSWORD}"
     __log "MySQL root user:    root"
     __log "MySQL root pass:    ${ISPCONFIG_MYSQL_ROOT_PASSWORD}"
