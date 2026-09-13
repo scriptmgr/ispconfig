@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202608272305-git
+##@Version           :  202609131048-git
 # @@Author           :  ISPConfig Universal Installer Contributors
 # @@Contact          :  https://github.com/scriptmgr/ispconfig
 # @@License          :  MIT
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202608272305-git"
+VERSION="202609131048-git"
 
 # Universal ISPConfig Installation Script
 # Architecture: Nginx (frontend, SSL termination) → Apache (backend, 127.0.0.1:81)
@@ -1509,7 +1509,7 @@ MPMEOF
             # but the httpd package ships mod_suexec.so without a LoadModule line —
             # without this, httpd fails to start entirely (502 from nginx in front).
             # This base image's httpd.conf hand-lists every LoadModule directly
-            # (matching casjay-base/centos/etc/httpd/conf/httpd.conf) with no
+            # (matching casjay-base/rhel/etc/httpd/conf/httpd.conf) with no
             # IncludeOptional conf.modules.d/*.conf, so a conf.modules.d drop-in
             # is silently ignored — insert the line into httpd.conf itself,
             # right after the existing fcgid_module line it's always paired with.
