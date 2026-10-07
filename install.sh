@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202609131048-git
+##@Version           :  202610050039-git
 # @@Author           :  ISPConfig Universal Installer Contributors
 # @@Contact          :  https://github.com/scriptmgr/ispconfig
 # @@License          :  MIT
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202609131048-git"
+VERSION="202610050039-git"
 
 # Universal ISPConfig Installation Script
 # Architecture: Nginx (frontend, SSL termination) → Apache (backend, 127.0.0.1:81)
@@ -50,7 +50,7 @@ PACKAGE_MANAGER=""
 SERVICE_MANAGER="systemctl"
 # fallback; overwritten after install to highest available version
 PHP_DEFAULT="8.3"
-PHP_VERSIONS=("8.5" "8.4" "8.3" "8.2" "8.1" "8.0" "7.4" "7.3" "7.2" "7.1" "7.0" "5.6")
+PHP_VERSIONS=("8.5" "8.4" "8.3" "8.2" "8.1" "8.0" "7.4")
 
 # Reverse proxy settings
 APACHE_BACKEND_IP="127.0.0.1"
@@ -110,11 +110,12 @@ __step() {
         spin_pid=$!
     fi
     trap 'ec=$?; [[ -n "${spin_pid:-}" ]] && kill "$spin_pid" 2>/dev/null; __failed "$desc" "$logfile" "$ec"' EXIT
-    if { "$@"; } >"$logfile" 2>&1; then
-        rc=0
-    else
-        rc=$?
-    fi
+    # The function must run in a subshell, NOT as `if { "$@"; }`. In a
+    # condition context bash suspends set -e for the whole function body, so a
+    # mid-function failure is silently discarded and only the last command's
+    # status reaches us — a step could fail halfway and still report [OK].
+    # Running it as a plain command in a subshell keeps set -e armed inside.
+    ( "$@" ) >"$logfile" 2>&1 && rc=0 || rc=$?
     trap - EXIT
     if [[ -n "${spin_pid:-}" ]]; then
         kill "$spin_pid" 2>/dev/null || true
@@ -332,37 +333,6 @@ __install_base_packages() {
     esac
 }
 
-# ── Firewall ──────────────────────────────────────────────────────────────────
-__configure_firewall() {
-    __log "Configuring firewall..."
-    case "$DISTRO" in
-        "ubuntu"|"debian")
-            command -v ufw &>/dev/null || apt-get install -y ufw
-            ufw --force enable
-            for port in ssh http https ftp; do ufw allow $port; done
-            for port in 21 25 110 143 465 587 993 995 53 $ADMIN_PORT; do ufw allow ${port}/tcp; done
-            ufw allow 53/udp
-            ufw allow 49152:65534/tcp
-            # Mosh server uses UDP 60000-61000 for encrypted remote terminal sessions
-            ufw allow 60000:61000/udp
-            ;;
-        *)
-            if command -v firewall-cmd &>/dev/null; then
-                systemctl enable firewalld && systemctl start firewalld
-                for svc in http https ssh ftp smtp pop3 imap smtps pop3s imaps dns; do
-                    firewall-cmd --permanent --add-service=$svc
-                done
-                for port in 21 49152-65534 ${ADMIN_PORT} 587; do
-                    firewall-cmd --permanent --add-port=${port}/tcp
-                done
-                # Mosh server uses UDP 60000-61000 for encrypted remote terminal sessions
-                firewall-cmd --permanent --add-port=60000-61000/udp
-                firewall-cmd --reload
-            fi
-            ;;
-    esac
-}
-
 # ── Nginx install + config ────────────────────────────────────────────────────
 __install_nginx() {
     __log "Installing Nginx..."
@@ -487,8 +457,11 @@ http {
     ssl_session_cache           shared:SSL:50m;
     ssl_session_timeout         1d;
     ssl_session_tickets         off;
-    ssl_stapling                on;
-    ssl_stapling_verify         on;
+    # OCSP stapling is deliberately NOT set globally: the installer ships
+    # self-signed certs, and stapling against a self-signed leaf makes nginx
+    # log "issuer certificate not found" on every start while doing nothing.
+    # The Let's Encrypt vhost generator enables it per-vhost, where the chain
+    # actually reaches a real CA.
     ssl_trusted_certificate     SSL_CA_BUNDLE_PLACEHOLDER;
     resolver                    1.1.1.1 8.8.8.8 valid=300s;
     resolver_timeout            5s;
@@ -894,6 +867,12 @@ __configure_mail_public() {
     # Use ISPConfig's SSL cert for mail TLS (already created by ISPConfig install)
     local mail_cert="/usr/local/ispconfig/interface/ssl/ispserver.crt"
     local mail_key="/usr/local/ispconfig/interface/ssl/ispserver.key"
+    # Dovecot's packaged service runs in a confined SELinux domain; use the
+    # distro-managed certificate paths unless ISPConfig's mail certificate exists.
+    if [[ ! -r "$mail_cert" || ! -r "$mail_key" ]]; then
+        mail_cert="/etc/pki/dovecot/certs/dovecot.pem"
+        mail_key="/etc/pki/dovecot/private/dovecot.pem"
+    fi
 
     # Outbound: opportunistic TLS — required by Gmail, Yahoo, Outlook, etc.
     postconf -e "smtp_tls_security_level = may"
@@ -964,6 +943,14 @@ MASTEREOF
                 -e "s|^ssl_cert = .*|ssl_cert = <${mail_cert}|" \
                 -e "s|^ssl_key = .*|ssl_key = <${mail_key}|" \
                 "$dovecot_ssl_conf"
+            # AlmaLinux's main dovecot.conf may define these settings again;
+            # update that active override or it wins over conf.d/10-ssl.conf.
+            if [[ -f /etc/dovecot/dovecot.conf ]]; then
+                sed -i \
+                    -e "s|^ssl_cert = .*|ssl_cert = <${mail_cert}|" \
+                    -e "s|^ssl_key = .*|ssl_key = <${mail_key}|" \
+                    /etc/dovecot/dovecot.conf
+            fi
         fi
         if grep -q -- "ssl_min_protocol\|ssl_protocols" "$dovecot_ssl_conf"; then
             sed -i \
@@ -1260,7 +1247,6 @@ configure_ftp=y
 configure_dns=y
 configure_apache=y
 configure_nginx=n
-configure_firewall=n
 install_ispconfig_web_interface=y
 EOF
 
@@ -1293,6 +1279,20 @@ EOF
         "$mysql_bin" -u root -p"${ISPCONFIG_MYSQL_ROOT_PASSWORD}" dbispconfig -e \
             "UPDATE sys_user SET username='${ISPCONFIG_ADMIN_USER}' WHERE username='admin';"
         __log "Renamed ISPConfig admin user to '${ISPCONFIG_ADMIN_USER}'"
+    fi
+
+    # The panel reads its DB settings from lib/config.inc.php, but autoinstall.ini
+    # gave us db_host=127.0.0.1 while the GRANT it created is for the server
+    # FQDN. MariaDB resolves 127.0.0.1 to 'localhost', finds no matching grant,
+    # and the panel dies with "queryOneRecord() on false". Point db_host at the
+    # same FQDN the grant was issued for.
+    local ispc_config="/usr/local/ispconfig/interface/lib/config.inc.php"
+    if [[ -f "$ispc_config" ]]; then
+        sed -i -e "s|\\\$conf\['db_host'\] = '[^']*'|\\\$conf['db_host'] = '${HOSTNAME}'|" \
+            "$ispc_config"
+        __log "Set panel db_host to ${HOSTNAME} (matches the GRANT issued at install)"
+    else
+        __warn "${ispc_config} not found — panel DB host left as-is"
     fi
 }
 
@@ -1622,7 +1622,6 @@ RIPEOF
                         -e "s|PHPRC=.*|PHPRC=${rhel_phprc}|" \
                         -e "s|exec /usr/bin/php-cgi|exec ${rhel_php_cgi}|" \
                         "$starter" > "$_tmp" && cp "$_tmp" "$starter"
-                    chattr +i "$starter" 2>/dev/null || true
                     rm -f "$_tmp"
                     __log "Patched ${starter} → ${rhel_php_cgi}"
                 done
@@ -1633,6 +1632,116 @@ RIPEOF
     esac
 
     __success "Apache reconfigured: backend on ${APACHE_BACKEND_IP}:${APACHE_BACKEND_PORT} / admin on ${APACHE_BACKEND_IP}:${APACHE_ADMIN_PORT}"
+}
+
+# ── SELinux labels (RHEL-family) ─────────────────────────────────────────────
+# Everything ISPConfig creates is born unconfined_u:usr_t / httpd_sys_content_t,
+# which httpd_t and httpd_suexec_t may not read or write. Without these labels
+# httpd and nginx are denied name_bind on the custom ports (both services fail
+# to start), nginx cannot proxy to the Apache backend (502 on every request),
+# and the panel dies inside mod_fcgid. None of it is visible in the install
+# output, and __step would report [OK] regardless.
+__configure_selinux() {
+    if ! command -v semanage >/dev/null 2>&1; then
+        __warn "semanage not available — skipping SELinux labelling"
+        return 0
+    fi
+    if [[ "$(getenforce 2>/dev/null)" == "Disabled" ]]; then
+        __log "SELinux disabled — skipping labelling"
+        return 0
+    fi
+
+    __log "Applying SELinux policy for ISPConfig..."
+
+    # 1. nginx must be allowed to open network sockets and proxy to Apache.
+    setsebool -P httpd_can_network_connect on
+    setsebool -P httpd_can_network_relay on 2>/dev/null || true
+    setsebool -P httpd_enable_homedirs on 2>/dev/null || true
+
+    # 2. Custom ports need an explicit http_port_t label or name_bind is denied
+    #    and the service refuses to start. Covers the public ports, the loopback
+    #    Apache backend ports, and the panel port.
+    local p
+    for p in 80 443 7080 8081 "$ADMIN_PORT" "$APACHE_BACKEND_PORT" \
+             "$APACHE_ADMIN_PORT" "$APACHE_APPS_PORT"; do
+        [[ "$p" =~ ^[0-9]+$ ]] || continue
+        semanage port -d -t transproxy_port_t -p tcp "$p" 2>/dev/null || true
+        semanage port -d -t unreserved_port_t -p tcp "$p" 2>/dev/null || true
+        semanage port -a -t http_port_t -p tcp "$p" 2>/dev/null \
+            || semanage port -m -t http_port_t -p tcp "$p" 2>/dev/null || true
+    done
+
+    # 3. ISPConfig's own tree is written at runtime by httpd_t/suexec (sessions,
+    #    IDS storage, cache) — label it read-write instead of the default usr_t.
+    semanage fcontext -a -t httpd_sys_rw_content_t "/usr/local/ispconfig(/.*)?" 2>/dev/null \
+        || semanage fcontext -m -t httpd_sys_rw_content_t "/usr/local/ispconfig(/.*)?" 2>/dev/null \
+        || true
+    semanage fcontext -a -t var_log_t "/var/log/ispconfig(/.*)?" 2>/dev/null \
+        || semanage fcontext -m -t var_log_t "/var/log/ispconfig(/.*)?" 2>/dev/null \
+        || true
+    semanage fcontext -a -t httpd_log_t "/var/log/ispconfig/auth.log" 2>/dev/null \
+        || semanage fcontext -m -t httpd_log_t "/var/log/ispconfig/auth.log" 2>/dev/null \
+        || true
+    semanage fcontext -a -t httpd_sys_script_exec_t "/usr/local/ispconfig/server/scripts/vlogger" 2>/dev/null \
+        || semanage fcontext -m -t httpd_sys_script_exec_t "/usr/local/ispconfig/server/scripts/vlogger" 2>/dev/null \
+        || true
+
+    # 4. The PHP-FCGI starters are executed by suexec, which requires
+    #    httpd_sys_script_exec_t. ISPConfig ships them immutable AND mislabelled;
+    #    an immutable file cannot be relabelled, so clear the flag first.
+    for starter in /var/www/php-fcgi-scripts/*/.php-fcgi-starter; do
+        [[ -f "$starter" ]] || continue
+        chattr -i "$starter" 2>/dev/null || true
+    done
+    semanage fcontext -a -t httpd_sys_script_exec_t "/var/www/php-fcgi-scripts(/.*)?" 2>/dev/null \
+        || semanage fcontext -m -t httpd_sys_script_exec_t "/var/www/php-fcgi-scripts(/.*)?" 2>/dev/null \
+        || true
+
+    # 5. vlogger writes per-vhost log dirs under /var/log/ispconfig; without a
+    #    var_log_t label httpd_t is denied and every vhost logs AH00106.
+    #    vlogger runs as root but inside httpd_sys_script_t, which lacks
+    #    CAP_DAC_OVERRIDE — it cannot create anything under a directory it does
+    #    not own. Own the tree by root and give the Apache group read access;
+    #    setgid keeps new files group-readable for Apache.
+    mkdir -p /var/log/ispconfig/httpd
+    chown -R root:apache /var/log/ispconfig/httpd
+    chmod 2775 /var/log/ispconfig/httpd
+    chmod 0755 /usr/local/ispconfig/server /usr/local/ispconfig/server/scripts \
+        /usr/local/ispconfig/server/scripts/vlogger 2>/dev/null || true
+
+    # 6. postfix's postalias reads /var/lib/aliases, created outside the package
+    #    and so left as var_lib_t.
+    semanage fcontext -a -t postfix_etc_t "/var/lib/aliases(/.*)?" 2>/dev/null \
+        || semanage fcontext -m -t postfix_etc_t "/var/lib/aliases(/.*)?" 2>/dev/null || true
+
+    # 7. PHP's OPcache locks a memfd shared-memory segment. Under
+    #    httpd_sys_script_t that memfd is typed tmpfs_t and the lock is denied,
+    #    which kills the FastCGI child before it can emit headers (HTTP 500 on
+    #    every request). OPcache buys little for short-lived CGI processes, so
+    #    disable it for the CGI SAPI only — CLI and FPM are unaffected.
+    local _phpc _ini _phpver
+    for _phpc in /opt/remi/php*/root/usr/bin/php-cgi /usr/bin/php-cgi; do
+        [[ -x "$_phpc" ]] || continue
+        if [[ "$_phpc" == /opt/remi/php*/root/usr/bin/php-cgi ]]; then
+            local _phpver="${_phpc#/opt/remi/}"
+            _phpver="${_phpver%%/*}"
+            _ini="/etc/opt/remi/${_phpver}/php.d"
+        else
+            _ini="/etc/php.d"
+        fi
+        [[ -d "$_ini" ]] || continue
+        printf '%s\n' \
+            '; Disabled for CGI: OPcache memfd locking is denied under' \
+            '; httpd_sys_script_t and aborts the FastCGI child (HTTP 500).' \
+            '[opcache]' \
+            'opcache.enable=0' \
+            'opcache.enable_cli=0' > "${_ini}/99-opcache-cgi-off.ini"
+        __log "Disabled OPcache for CGI (${_ini})"
+    done
+
+    restorecon -R /usr/local/ispconfig /var/log/ispconfig /var/www/php-fcgi-scripts 2>/dev/null || true
+
+    __success "SELinux policy applied (ports, booleans, file contexts)"
 }
 
 # ── ISPConfig + Nginx wiring ──────────────────────────────────────────────────
@@ -1671,9 +1780,16 @@ server {
     ssl_certificate     ${SSL_DIR}/ispconfig.crt;
     ssl_certificate_key ${SSL_DIR}/ispconfig.key;
 
+    # The panel application sets these itself via PHP header(). If nginx adds
+    # them too, every panel response carries each header twice. Nginx owns them
+    # here and the upstream copies are hidden, so exactly one copy reaches the
+    # client regardless of what the panel emits.
+    proxy_hide_header Strict-Transport-Security;
+    proxy_hide_header X-Content-Type-Options;
+    proxy_hide_header X-Frame-Options;
     add_header Strict-Transport-Security "max-age=31536000" always;
-    add_header X-Content-Type-Options nosniff always;
-    add_header X-Frame-Options SAMEORIGIN always;
+    add_header X-Content-Type-Options    nosniff always;
+    add_header X-Frame-Options           SAMEORIGIN always;
 
     location / {
         proxy_pass http://ispconfig_admin;
@@ -1692,6 +1808,14 @@ VHOSTS_DIR="/etc/nginx/vhosts.d"
 APACHE_BACKEND="127.0.0.1:81"
 changed=0
 
+# Let's Encrypt chains are real, so stapling is meaningful here — but only if
+# this host actually ships a CA bundle to verify the issuer against.
+CA_BUNDLE=""
+for c in /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt \
+         /etc/pki/tls/cert.pem /etc/ssl/certs/ca-bundle.crt; do
+    [[ -f "$c" ]] && CA_BUNDLE="$c" && break
+done
+
 for cert_dir in /etc/letsencrypt/live/*/; do
     domain="${cert_dir%/}"
     domain="${domain##*/}"
@@ -1700,6 +1824,13 @@ for cert_dir in /etc/letsencrypt/live/*/; do
     privkey="${cert_dir}privkey.pem"
 
     [[ -f "$fullchain" && -f "$privkey" ]] || continue
+
+    STAPLING_DIRECTIVES=""
+    if [[ -n "$CA_BUNDLE" ]]; then
+        STAPLING_DIRECTIVES="ssl_stapling on;
+    ssl_stapling_verify on;
+    ssl_trusted_certificate ${CA_BUNDLE};"
+    fi
 
     new_content="server {
     listen      443 ssl http2;
@@ -1710,6 +1841,11 @@ for cert_dir in /etc/letsencrypt/live/*/; do
     ssl_certificate_key ${privkey};
 
     add_header Strict-Transport-Security \"max-age=31536000; includeSubDomains\" always;
+
+    # Real CA chain here, so stapling is meaningful. The CA bundle path is
+    # resolved at sync time (CA_BUNDLE) because it differs per distro and this
+    # script also runs on hosts the installer never touched.
+    ${STAPLING_DIRECTIVES}
 
     location ^~ /.well-known/acme-challenge/ {
         root /var/www/letsencrypt;
@@ -1778,6 +1914,51 @@ __configure_ssl() {
 }
 
 # ── Final configuration ───────────────────────────────────────────────────────
+# ── amavisd repair ─────────────────────────────────────────────────────────────
+__fixup_amavisd() {
+    # amavisd is optional; nothing to do when the package is absent.
+    [[ -d /etc/amavisd ]] || return 0
+
+    __log "Repairing amavisd installation..."
+
+    # 1. Missing Perl DBI driver. The amavis RPM does not pull perl-DBD-mysql in,
+    #    and amavisd hard-exits with "MISSING REQUIRED ADDITIONAL MODULES"
+    #    before it ever binds a socket.
+    if ! perl -MDBD::mysql -e1 2>/dev/null; then
+        __try_install "$PACKAGE_MANAGER" perl-DBI perl-DBD-mysql \
+            || __warn "amavisd: perl DBD::mysql unavailable — amavisd will not start"
+    fi
+
+    # 2. ISPConfig's installer_base.lib.php chmods amavisd.conf and 60-dkim to
+    #    0640 but leaves the group as root. amavisd drops to $daemon_user
+    #    (amavis), so it falls into the "other" class and gets EACCES on its
+    #    own config. Restore group-read for the amavis group across the tree.
+    chgrp -R amavis /etc/amavisd 2>/dev/null || true
+    find /etc/amavisd -type f -exec chmod g+r,o-r {} + 2>/dev/null || true
+
+    # 3. SELinux: amavisd runs as antivirus_exec_t but ports 10026/10027 ship
+    #    as spamd_port_t, so it cannot bind its own nanny port and dies with
+    #    "Can't connect to TCP port 10026 on 127.0.0.1 [Permission denied]".
+    #    10024 already carries amavisd_recv_port_t.
+    if command -v semanage >/dev/null 2>&1; then
+        local p
+        for p in 10026 10027; do
+            semanage port -a -t amavisd_recv_port_t -p tcp "$p" 2>/dev/null \
+                || semanage port -m -t amavisd_recv_port_t -p tcp "$p" 2>/dev/null || true
+        done
+        restorecon -R /etc/amavisd 2>/dev/null || true
+    fi
+
+    # 4. The package ships disabled, so on a real reboot amavisd never comes up
+    #    and Postfix's content_filter points at a dead port.
+    systemctl enable amavisd 2>/dev/null || true
+    systemctl reset-failed amavisd 2>/dev/null || true
+    systemctl restart amavisd 2>/dev/null \
+        || __warn "amavisd failed to start — check: journalctl -u amavisd"
+
+    __success "amavisd configuration repaired"
+}
+
 __final_configuration() {
     __log "Performing final configuration..."
 
@@ -1812,6 +1993,7 @@ EOF
     esac
 
     systemctl restart postfix dovecot proftpd 2>/dev/null || true
+    __fixup_amavisd
     nginx -t && systemctl start nginx
 
     # Sync any existing Let's Encrypt certs into Nginx vhosts (no-op on fresh installs)
@@ -1819,12 +2001,99 @@ EOF
         /usr/local/bin/ispconfig-nginx-sync 2>/dev/null || true
     fi
 
+    # Verify the stack actually came up. A service that failed to start leaves
+    # the machine unusable but every step above still reports [OK], because the
+    # restarts are masked with "2>/dev/null || true". Check explicitly and fail
+    # the step rather than handing the operator a green summary.
+    __verify_services
+
     __create_php_test_script
+}
+
+# Assert every service this installer depends on is actually running, and that
+# the panel answers. A non-zero exit fails the calling __step.
+__verify_services() {
+    local failed=() svc
+
+    for svc in "${APACHE_SERVICE}" nginx postfix; do
+        systemctl is-active --quiet "$svc" || failed+=("$svc")
+    done
+
+    # amavisd only when the package is present. Postfix's content_filter points
+    # at 127.0.0.1:10024, so a dead amavisd silently breaks the mail path.
+    if [[ -d /etc/amavisd ]]; then
+        systemctl is-active --quiet amavisd || failed+=("amavisd")
+    fi
+
+    if ((${#failed[@]} > 0)); then
+        __error "Service(s) not running after install: ${failed[*]}"
+        for svc in "${failed[@]}"; do
+            __log "--- systemctl status ${svc} ---"
+            systemctl status "$svc" --no-pager --lines=5 2>&1 | head -8 || true
+        done
+        return 1
+    fi
+
+    # The panel must answer through nginx, not just be listening. 000 means the
+    # connection was refused; 5xx means the proxy chain is broken.
+    local code
+    code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 \
+        "https://${APACHE_BACKEND_IP}:${ADMIN_PORT}/" 2>/dev/null || echo 000)
+    case "$code" in
+        200|30[0-9])
+            __log "ISPConfig panel responding (HTTP ${code})"
+            ;;
+        000)
+            __error "ISPConfig panel unreachable on https://${APACHE_BACKEND_IP}:${ADMIN_PORT}/ (connection refused)"
+            return 1
+            ;;
+        *)
+            __error "ISPConfig panel returned HTTP ${code} on port ${ADMIN_PORT}"
+            return 1
+            ;;
+    esac
 }
 
 __create_php_test_script() {
     local web_root="/var/www/html"
     [[ "$DISTRO" =~ ^(opensuse|sles) ]] && web_root="/srv/www/htdocs"
+
+    # The distro packages drop a stock test page in the webroot ("Test Page for
+    # the HTTP Server on AlmaLinux", Debian's default index, etc.). That is what
+    # answers on the public IP until the operator points a vhost somewhere real,
+    # which reads as an unconfigured server to the internet. Replace it with a
+    # neutral holding page naming the panel.
+    if [[ -f "${web_root}/index.html" ]]; then
+        cat > "${web_root}/index.html" << 'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ISPConfig installed</title>
+</head>
+<body>
+<h1>ISPConfig is installed</h1>
+<p>This server has no default website configured yet.</p>
+<p>Point a domain at this IP and create a website in the ISPConfig panel to replace this page.</p>
+<p>Control panel: see <code>/root/ispconfig_installation_summary.txt</code> on the server for the URL.</p>
+</body>
+</html>
+EOF
+        chown "${NGINX_USER}:${NGINX_USER}" "${web_root}/index.html" 2>/dev/null || true
+        chmod 644 "${web_root}/index.html"
+        __log "Replaced the distro default page with an ISPConfig holding page"
+    fi
+
+    # phpinfo() in a publicly reachable document root discloses the full PHP
+    # build, loaded modules, environment and every *_PASSWD superglobal. It is
+    # a diagnostic aid, not a default. Opt in with ISPCONFIG_PHPINFO=1.
+    if [[ "${ISPCONFIG_PHPINFO:-0}" != "1" ]]; then
+        rm -f "${web_root}/phpinfo.php"
+        __log "phpinfo.php not created (set ISPCONFIG_PHPINFO=1 to enable)"
+        return 0
+    fi
+    __warn "ISPCONFIG_PHPINFO=1 — phpinfo.php WILL be publicly reachable"
 
     cat > "${web_root}/phpinfo.php" << 'EOF'
 <?php
@@ -1888,7 +2157,7 @@ SSL certificates (self-signed, replace with Let's Encrypt):
   Mail TLS:   /usr/local/ispconfig/interface/ssl/ispserver.{crt,key}
   DH params:  /etc/nginx/dhparam.pem
 
-Mail server ports (ensure these are open in your firewall/cloud panel):
+Mail server ports (the sysadmin must open these externally according to site policy):
   25   — SMTP (inbound from internet, MX delivery)
   465  — SMTPS (authenticated submission, TLS wrapper)
   587  — Submission (authenticated submission, STARTTLS)
@@ -1934,9 +2203,10 @@ Next steps:
   4. Configure DKIM/SPF/DMARC DNS records (see above)
   5. Set reverse DNS (PTR) for your server IP with your VPS provider
   6. Drop custom app vhosts in ${NGINX_VHOSTS_DIR}/
-  7. Remove /var/www/html/phpinfo.php before going live
+  7. Replace self-signed certs with Let's Encrypt before going live
 EOF
 
+    chmod 0600 /root/ispconfig_installation_summary.txt
     __log "Summary saved to /root/ispconfig_installation_summary.txt"
 }
 
@@ -1956,8 +2226,6 @@ __main() {
 
     __step "Updating system packages"          __update_system
     __step "Installing base packages"          __install_base_packages
-    __step "Configuring firewall"              __configure_firewall
-
     __step "Installing Nginx"                  __install_nginx
     __step "Installing Apache"                 __install_apache
     __step "Installing MySQL/MariaDB"          __install_mysql
@@ -1970,12 +2238,30 @@ __main() {
     __step "Installing ISPConfig"              __install_ispconfig
 
     __step "Configuring Apache backend"        __configure_apache_backend
+    __step "Applying SELinux policy"           __configure_selinux
     __step "Configuring Nginx for ISPConfig"   __configure_ispconfig_nginx
     __step "Configuring public mail records"   __configure_mail_public
     __step "Configuring SSL"                   __configure_ssl
 
     __step "Finalizing configuration"          __final_configuration
     __create_summary
+
+    # Print what was actually persisted, not the in-memory variables, so the
+    # console can never advertise a credential the system did not take.
+    local summary_file=/root/ispconfig_installation_summary.txt
+    local admin_pass root_pass db_pass
+    admin_pass=$(sed -n 's/^  ISPConfig password: //p' "${summary_file}")
+    root_pass=$(sed -n 's/^  MySQL root pass: *//p' "${summary_file}")
+    db_pass=$(sed -n 's/^  ISPConfig DB pass: *//p' "${summary_file}")
+    if [[ -z "$admin_pass" || -z "$root_pass" || -z "$db_pass" ]]; then
+        __error "Could not read credentials back from ${summary_file}"
+    fi
+    local mysql_bin="mysql"
+    command -v mariadb >/dev/null 2>&1 && mysql_bin="mariadb"
+    if ! "${mysql_bin}" -u root -p"${root_pass}" -e 'SELECT 1' >/dev/null 2>&1; then
+        __error "The MySQL root password in ${summary_file} does not authenticate"
+    fi
+    __success "Credentials in ${summary_file} verified against the live system"
 
     echo -e "${GREEN}"
     __log "============================================"
@@ -1986,11 +2272,11 @@ __main() {
     server_ip=$(hostname -I | awk '{print $1}')
     __log "ISPConfig panel:    https://${server_ip}:${ADMIN_PORT}"
     __log "ISPConfig username: ${ISPCONFIG_ADMIN_USER}"
-    __log "ISPConfig password: ${ISPCONFIG_ADMIN_PASSWORD}"
+    __log "ISPConfig password: ${admin_pass}"
     __log "MySQL root user:    root"
-    __log "MySQL root pass:    ${ISPCONFIG_MYSQL_ROOT_PASSWORD}"
+    __log "MySQL root pass:    ${root_pass}"
     __log "ISPConfig DB user:  ispconfig"
-    __log "ISPConfig DB pass:  ${ISPCONFIG_DB_PASSWORD}"
+    __log "ISPConfig DB pass:  ${db_pass}"
     __warn "Credentials saved to: /root/ispconfig_installation_summary.txt"
     echo -e "${NC}"
 }

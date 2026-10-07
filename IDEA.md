@@ -16,7 +16,7 @@ official_site: https://github.com/scriptmgr/ispconfig
 - Must be distro-agnostic across the package managers it supports: apt, dnf, yum, zypper
 - Must generate all passwords/secrets at runtime — never ship or require a static credential
 - Must install ISPConfig with Nginx terminating TLS in front of Apache (Apache never exposed directly)
-- Must support multiple co-installed PHP versions (5.6 through the current stable)
+- Must support multiple co-installed PHP versions (7.4 through the current stable)
 - Must produce a written summary of generated credentials and next steps for the operator
 - Must fail loudly and stop on any step that cannot complete — never continue past a broken step
 - Must not require any companion tooling, build step, or runtime beyond bash and the target distro's own package manager — the script is the whole deliverable

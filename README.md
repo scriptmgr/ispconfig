@@ -24,10 +24,10 @@ Output is one line per install step (with a spinner while it runs) — package-m
 ## ✨ Features
 
 - **🌍 Universal compatibility** — works across all major Linux distributions
-- **🐘 Multiple PHP versions** — installs PHP 5.6 through 8.5 with full extension support
+- **🐘 Multiple PHP versions** — installs PHP 7.4 through 8.5, whichever of those the distro's repositories actually offer — see [PHP version coverage](#-php-version-coverage)
 - **🔀 Nginx + Apache architecture** — Nginx handles SSL termination and static assets; Apache runs PHP on a loopback backend port
 - **🔧 Fully automated** — no interactive prompts; generates all passwords at runtime
-- **🛡️ Security first** — firewall rules, TLS 1.2/1.3 only, HSTS, DH params, OCSP stapling
+- **🛡️ Security first** — TLS 1.2/1.3 only, HSTS, DH params, Apache bound to loopback, credentials written mode `0600`. **No firewall is configured** — see [Security Notes](#-security-notes)
 - **📧 Production mail stack** — Postfix + Dovecot + OpenDKIM with submission and SMTPS ports
 - **⚡ Production ready** — Event MPM, RemoteIP passthrough, PHP-FPM pools, logrotate
 
@@ -74,7 +74,7 @@ Apache listens only on loopback. All TLS, HSTS, and caching are handled by Nginx
 | Frontend proxy | Nginx (Event, SSL, gzip, open-file-cache) |
 | Web backend | Apache (Event MPM, mod-fcgid, RemoteIP) |
 | Database | MariaDB (secured, root password in `/root/.my.cnf`) |
-| PHP | 5.6, 7.0, 7.1, 7.2, 7.3, 7.4, 8.0, 8.1, 8.2, 8.3, 8.4, 8.5 with FPM |
+| PHP | Whatever the distro repos provide, up to 8.5, with FPM — see [PHP version coverage](#-php-version-coverage) |
 | Mail | Postfix + Dovecot + OpenDKIM (ports 25, 465, 587, 143, 993, 110, 995) |
 | FTP | ProFTPd with MySQL authentication |
 | DNS | BIND9 / named |
@@ -118,7 +118,29 @@ certbot certonly --webroot -w /var/www/letsencrypt -d example.com -d www.example
 
 ### Test PHP versions
 
-Visit `http://<server-ip>/phpinfo.php` — lists all installed PHP versions and confirms `X-Forwarded-Proto` passthrough. **Remove before going live.**
+`phpinfo.php` is **not created by default**, because `phpinfo()` in a public document root discloses the PHP build, loaded modules, environment and every `*_PASSWD` superglobal.
+
+To generate it for testing, set `ISPCONFIG_PHPINFO=1` before running the installer:
+
+```bash
+ISPCONFIG_PHPINFO=1 sudo bash install.sh
+```
+
+Visit `http://<server-ip>/phpinfo.php` to list all installed PHP versions and confirm `X-Forwarded-Proto` passthrough. **Remove it before going live** (`rm -f /var/www/html/phpinfo.php`).
+
+---
+
+## 🐘 PHP version coverage
+
+The supported range is **PHP 7.4 → 8.5**. Each version is installed **only if the distro's repositories actually provide it**. Anything unavailable is skipped with a `WARN` line naming the version — the step still reports `[OK]`, so check the install log for `[WARN] PHP ... not available` to see what you actually got.
+
+| Family | Usual range | Caveat |
+|---|---|---|
+| Debian / Ubuntu | 7.4 – 8.5 | Ondrej PPA — some series lag the newest releases |
+| RHEL / AlmaLinux / Rocky / Fedora | 7.4 – 8.5 (Remi) | — |
+| openSUSE / SLES | repo-provided only | varies by distribution |
+
+PHP 5.6 and 7.0–7.3 are **not supported** and are never requested. The installer targets 7.4 as the oldest supported series; anything older must be sourced from an external repository you supply yourself.
 
 ---
 
@@ -135,6 +157,21 @@ Visit `http://<server-ip>/phpinfo.php` — lists all installed PHP versions and 
 | `/etc/dovecot/conf.d/` | Dovecot config |
 | `/etc/opendkim.conf` | OpenDKIM config |
 | `/usr/local/bin/ispconfig-nginx-sync` | Cert sync helper |
+
+### Ports to open
+
+The installer configures **no firewall** — this is what you need to allow inbound if you set one up:
+
+| Port | Service | Exposure |
+|---|---|---|
+| 80 | Nginx HTTP | Public |
+| 443 | Nginx HTTPS | Public |
+| 64245 | ISPConfig panel | Public (restrict to your IP if possible) |
+| 21 | ProFTPd | Public if FTP is used |
+| 22 | SSH | Public — **keep this open or you will lock yourself out** |
+| 25, 465, 587 | Postfix SMTP / SMTPS / submission | Public if mail is used |
+| 110, 143, 993, 995 | Dovecot POP3 / IMAP / IMAPS / POP3S | Public if mail is used |
+| 81, 7080, 7081 | Apache backend | Loopback only — never open |
 
 ### Add a custom Nginx vhost
 
@@ -210,10 +247,13 @@ systemctl restart mariadb
 
 **Cannot reach the ISPConfig panel**
 ```bash
+systemctl status nginx apache2    # check both are running
+ss -lntp | grep -E ':(443|64245)\b'   # confirm they are listening
+# If you have enabled a firewall yourself, check what it allows:
 ufw status                        # Debian/Ubuntu
 firewall-cmd --list-ports         # RHEL-family
-systemctl status nginx apache2    # check both are running
 ```
+> The installer does **not** enable or configure a firewall, so these checks only apply if you turned one on.
 
 **PHP version missing in ISPConfig**
 ```bash
@@ -254,10 +294,10 @@ Root access is required.
 
 ## ⚠️ Security Notes
 
-- All passwords are randomly generated at install time and saved to `/root/ispconfig_installation_summary.txt` — secure this file
-- SSL certificates are self-signed at install — replace with Let's Encrypt before serving traffic
-- Remove `/var/www/html/phpinfo.php` before going live
-- Review opened firewall ports and close any not needed for your use case
+- All passwords are randomly generated at install time and saved to `/root/ispconfig_installation_summary.txt` (mode `0600`) — the installer verifies them against the live system before exiting
+- SSL certificates are self-signed at install — replace with Let's Encrypt before serving traffic. OCSP stapling stays enabled but is inert until then (`ssl_stapling ignored, issuer certificate not found`)
+- **The installer configures no firewall.** firewalld/ufw/nftables are left exactly as the base image shipped them — on AlmaLinux that means `iptables` policies `ACCEPT` with no rules. Every port the panel and mail stack bind is world-reachable. Enable and configure a firewall yourself before serving traffic; the ports to open are in [Key Paths](#-key-paths)
+- Nginx serves the distro's default test page on `443` until you replace the default vhost
 - Set a PTR record (reverse DNS) for your IP — required for reliable mail delivery
 
 ---
