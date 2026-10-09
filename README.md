@@ -13,11 +13,35 @@ chmod +x install.sh
 bash install.sh
 ```
 
-The script must be run as root. It detects your distribution automatically and requires no configuration.
+The script must be run as root. It detects your distribution automatically and requires no configuration. Credentials are generated automatically unless you provide overrides through environment variables.
 
 Output is one line per install step (with a spinner while it runs) — package-manager noise is captured, not streamed. A step that fails prints `[FAILED]` plus the last 40 lines of its captured log and stops the script.
 
 **If you're connecting over SSH, run it inside `tmux`/`screen`.** The first step is a full system upgrade, which can restart `sshd`/`systemd`/`dbus` (directly or via an auto-restart hook like `needrestart`) and kill the SSH session running the script — a terminal multiplexer survives that. The script warns if it detects SSH without one, but running inside `tmux new -s ispconfig` or `screen -S ispconfig` up front avoids the interruption entirely.
+
+### Environment overrides
+
+Set any of these variables before running the installer to choose credentials. If a password variable is unset or empty, the installer generates a random password. The admin username defaults to `admin`.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ISPCONFIG_MYSQL_ROOT_PASSWORD` | Generated | MariaDB root password |
+| `ISPCONFIG_ADMIN_PASSWORD` | Generated | ISPConfig panel password |
+| `ISPCONFIG_ADMIN_USER` | `admin` | ISPConfig panel username |
+| `ISPCONFIG_DB_PASSWORD` | Generated | Password for the ISPConfig database user |
+| `ISPCONFIG_PHPINFO` | Disabled | Set to `1` to create the public `phpinfo.php` diagnostic page; see [Test PHP versions](#test-php-versions) |
+
+For example, run with explicit credentials from a root shell:
+
+```bash
+ISPCONFIG_ADMIN_USER=paneladmin \
+ISPCONFIG_ADMIN_PASSWORD='choose-a-strong-password' \
+ISPCONFIG_MYSQL_ROOT_PASSWORD='choose-another-strong-password' \
+ISPCONFIG_DB_PASSWORD='choose-a-third-strong-password' \
+bash install.sh
+```
+
+Choose passwords that are safe to embed in SQL strings; avoid single quotes. The installer writes the resulting credentials to `/root/ispconfig_installation_summary.txt` with mode `0600`.
 
 ---
 
@@ -26,7 +50,7 @@ Output is one line per install step (with a spinner while it runs) — package-m
 - **🌍 Universal compatibility** — works across all major Linux distributions
 - **🐘 Multiple PHP versions** — installs PHP 7.4 through 8.5, whichever of those the distro's repositories actually offer — see [PHP version coverage](#-php-version-coverage)
 - **🔀 Nginx + Apache architecture** — Nginx handles SSL termination and static assets; Apache runs PHP on a loopback backend port
-- **🔧 Fully automated** — no interactive prompts; generates all passwords at runtime
+- **🔧 Fully automated** — no interactive prompts; generates passwords by default and supports environment overrides
 - **🛡️ Security first** — TLS 1.2/1.3 only, HSTS, DH params, Apache bound to loopback, credentials written mode `0600`. **No firewall is configured** — see [Security Notes](#-security-notes)
 - **📧 Production mail stack** — Postfix + Dovecot + OpenDKIM with submission and SMTPS ports
 - **⚡ Production ready** — Event MPM, RemoteIP passthrough, PHP-FPM pools, logrotate
@@ -77,7 +101,7 @@ Apache listens only on loopback. All TLS, HSTS, and caching are handled by Nginx
 | PHP | Whatever the distro repos provide, up to 8.5, with FPM — see [PHP version coverage](#-php-version-coverage) |
 | Mail | Postfix + Dovecot + OpenDKIM (ports 25, 465, 587, 143, 993, 110, 995) |
 | FTP | ProFTPd with MySQL authentication |
-| DNS | BIND9 / named |
+| DNS | BIND9 / named, enabled and started at install |
 | Control panel | ISPConfig 3 (latest stable) |
 | Anti-spam | SpamAssassin + Amavisd-new |
 | Antivirus | ClamAV |
@@ -112,9 +136,11 @@ All generated credentials, architecture details, port mapping, and next steps ar
 # Issue a cert (ACME webroot is pre-configured at /var/www/letsencrypt)
 certbot certonly --webroot -w /var/www/letsencrypt -d example.com -d www.example.com
 
-# Sync cert to Nginx vhosts (runs automatically on renewal via deploy hook)
+# Sync cert to Nginx vhosts and reload Nginx (runs automatically on renewal)
 /usr/local/bin/ispconfig-nginx-sync
 ```
+
+The sync helper processes certificate directories containing both `fullchain.pem` and `privkey.pem`, then tests and reloads Nginx even when the generated vhost configuration text has not changed. OCSP stapling is enabled for a vhost only when its certificate provides an OCSP responder URI and a local CA bundle is available.
 
 ### Test PHP versions
 
@@ -123,7 +149,7 @@ certbot certonly --webroot -w /var/www/letsencrypt -d example.com -d www.example
 To generate it for testing, set `ISPCONFIG_PHPINFO=1` before running the installer:
 
 ```bash
-ISPCONFIG_PHPINFO=1 sudo bash install.sh
+sudo env ISPCONFIG_PHPINFO=1 bash install.sh
 ```
 
 Visit `http://<server-ip>/phpinfo.php` to list all installed PHP versions and confirm `X-Forwarded-Proto` passthrough. **Remove it before going live** (`rm -f /var/www/html/phpinfo.php`).
@@ -295,9 +321,9 @@ Root access is required.
 ## ⚠️ Security Notes
 
 - All passwords are randomly generated at install time and saved to `/root/ispconfig_installation_summary.txt` (mode `0600`) — the installer verifies them against the live system before exiting
-- SSL certificates are self-signed at install — replace with Let's Encrypt before serving traffic. OCSP stapling stays enabled but is inert until then (`ssl_stapling ignored, issuer certificate not found`)
+- SSL certificates are self-signed at install — replace with Let's Encrypt before serving traffic. OCSP stapling is enabled only for certificates with an OCSP responder URI and an available local CA bundle.
 - **The installer configures no firewall.** firewalld/ufw/nftables are left exactly as the base image shipped them — on AlmaLinux that means `iptables` policies `ACCEPT` with no rules. Every port the panel and mail stack bind is world-reachable. Enable and configure a firewall yourself before serving traffic; the ports to open are in [Key Paths](#-key-paths)
-- Nginx serves the distro's default test page on `443` until you replace the default vhost
+- Requests for a hostname with no configured site get a `404` "No site at this address" page (static HTML/CSS, no JavaScript) from a catch-all Apache vhost, `00-ispconfig-nosite.conf`, instead of the distro test page
 - Set a PTR record (reverse DNS) for your IP — required for reliable mail delivery
 
 ---

@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202610050039-git
+##@Version           :  202610090047-git
 # @@Author           :  ISPConfig Universal Installer Contributors
 # @@Contact          :  https://github.com/scriptmgr/ispconfig
 # @@License          :  MIT
@@ -10,7 +10,7 @@
 # @@Created          :  Monday, August 24, 2026 15:34 EDT
 # @@File             :  install.sh
 # @@Description      :  Universal distro-agnostic ISPConfig installer with Nginx reverse proxy, multi-PHP, and full mail stack
-# @@Changelog        :  See git log for full history; latest: overridable ISPCONFIG_ADMIN_USER, post-install panel rename
+# @@Changelog        :  See git log for full history; latest: 404 catch-all page for unconfigured hosts, env credential overrides, DNS enable on boot
 # @@TODO             :  none
 # @@Other            :  none
 # @@Resource         :  https://www.ispconfig.org/
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202610050039-git"
+VERSION="202610090047-git"
 
 # Universal ISPConfig Installation Script
 # Architecture: Nginx (frontend, SSL termination) → Apache (backend, 127.0.0.1:81)
@@ -39,10 +39,10 @@ CLR_EOL='\033[K'
 
 # ── Global variables ──────────────────────────────────────────────────────────
 ADMIN_PORT=64245
-ISPCONFIG_MYSQL_ROOT_PASSWORD=""
-ISPCONFIG_ADMIN_PASSWORD=""
-ISPCONFIG_ADMIN_USER=""
-ISPCONFIG_DB_PASSWORD=""
+ISPCONFIG_MYSQL_ROOT_PASSWORD="${ISPCONFIG_MYSQL_ROOT_PASSWORD:-}"
+ISPCONFIG_ADMIN_PASSWORD="${ISPCONFIG_ADMIN_PASSWORD:-}"
+ISPCONFIG_ADMIN_USER="${ISPCONFIG_ADMIN_USER:-}"
+ISPCONFIG_DB_PASSWORD="${ISPCONFIG_DB_PASSWORD:-}"
 HOSTNAME=""
 DISTRO=""
 DISTRO_VERSION=""
@@ -1108,6 +1108,9 @@ __install_tools() {
             __try_install zypper quota awstats webalizer clamav amavisd-new spamassassin
             ;;
     esac
+
+    # Package scripts may start BIND without enabling it for the next boot.
+    systemctl enable --now named
 }
 
 # ── fail2ban install + jails ──────────────────────────────────────────────────
@@ -1534,10 +1537,12 @@ MPMEOF
             [[ -n "$ispc_apps_port"  ]] && APACHE_APPS_PORT="$ispc_apps_port"
             __log "ISPConfig panel port: ${APACHE_ADMIN_PORT}, apps port: ${APACHE_APPS_PORT}"
 
-            # Replace ALL Listen directives in httpd.conf with our loopback-only set.
-            # ISPConfig's vhost files also carry their own Listen lines which we
-            # will strip below — this leaves httpd.conf as the single authority.
-            sed -i '/^[[:space:]]*Listen /d' "${APACHE_CONF_DIR}/conf/httpd.conf"
+            # Replace public listeners and remove the obsolete Apache 2.2 vhost directive.
+            # ISPConfig's vhost files also carry Listen lines which are stripped below.
+            sed -i \
+                -e '/^[[:space:]]*Listen /d' \
+                -e '/^[[:space:]]*NameVirtualHost/d' \
+                "${APACHE_CONF_DIR}/conf/httpd.conf"
             cat >> "${APACHE_CONF_DIR}/conf/httpd.conf" << LISTENEOF
 
 # Backend ports — loopback only (nginx terminates TLS externally)
@@ -1806,10 +1811,9 @@ VHOST_EOF
 # Run after certbot renewal: add to /etc/letsencrypt/renewal-hooks/deploy/
 VHOSTS_DIR="/etc/nginx/vhosts.d"
 APACHE_BACKEND="127.0.0.1:81"
-changed=0
+cert_count=0
 
-# Let's Encrypt chains are real, so stapling is meaningful here — but only if
-# this host actually ships a CA bundle to verify the issuer against.
+# Stapling needs both an OCSP responder in the certificate and a local CA bundle.
 CA_BUNDLE=""
 for c in /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt \
          /etc/pki/tls/cert.pem /etc/ssl/certs/ca-bundle.crt; do
@@ -1824,9 +1828,11 @@ for cert_dir in /etc/letsencrypt/live/*/; do
     privkey="${cert_dir}privkey.pem"
 
     [[ -f "$fullchain" && -f "$privkey" ]] || continue
+    cert_count=$((cert_count + 1))
 
+    ocsp_uri=$(openssl x509 -in "$fullchain" -noout -ocsp_uri 2>/dev/null || true)
     STAPLING_DIRECTIVES=""
-    if [[ -n "$CA_BUNDLE" ]]; then
+    if [[ -n "$CA_BUNDLE" && -n "$ocsp_uri" ]]; then
         STAPLING_DIRECTIVES="ssl_stapling on;
     ssl_stapling_verify on;
     ssl_trusted_certificate ${CA_BUNDLE};"
@@ -1842,9 +1848,8 @@ for cert_dir in /etc/letsencrypt/live/*/; do
 
     add_header Strict-Transport-Security \"max-age=31536000; includeSubDomains\" always;
 
-    # Real CA chain here, so stapling is meaningful. The CA bundle path is
-    # resolved at sync time (CA_BUNDLE) because it differs per distro and this
-    # script also runs on hosts the installer never touched.
+    # OCSP stapling is enabled only when the certificate has a responder and a
+    # local CA bundle is available.
     ${STAPLING_DIRECTIVES}
 
     location ^~ /.well-known/acme-challenge/ {
@@ -1862,11 +1867,11 @@ for cert_dir in /etc/letsencrypt/live/*/; do
     [[ -f "$vhost_file" ]] && existing_content=$(< "$vhost_file")
     if [[ "$new_content" != "$existing_content" ]]; then
         echo "$new_content" > "$vhost_file"
-        changed=1
     fi
 done
 
-if [[ $changed -eq 1 ]]; then
+# Certificate contents can change while the generated vhost text stays the same.
+if [[ $cert_count -gt 0 ]]; then
     nginx -t && systemctl reload nginx
 fi
 SYNCEOF
@@ -2054,36 +2059,121 @@ __verify_services() {
     esac
 }
 
-__create_php_test_script() {
-    local web_root="/var/www/html"
-    [[ "$DISTRO" =~ ^(opensuse|sles) ]] && web_root="/srv/www/htdocs"
+# ── Catch-all "no site" page ──────────────────────────────────────────────────
+# Requests whose Host matches no configured site land on the first Apache vhost
+# for the backend port. Make that vhost answer 404 with a friendly static page
+# instead of the distro test page or another customer's site.
+__configure_nosite_page() {
+    local nosite_root="/var/www/ispconfig-nosite"
+    local nosite_conf="${APACHE_VHOST_DIR}/00-ispconfig-nosite.conf"
 
-    # The distro packages drop a stock test page in the webroot ("Test Page for
-    # the HTTP Server on AlmaLinux", Debian's default index, etc.). That is what
-    # answers on the public IP until the operator points a vhost somewhere real,
-    # which reads as an unconfigured server to the internet. Replace it with a
-    # neutral holding page naming the panel.
-    if [[ -f "${web_root}/index.html" ]]; then
-        cat > "${web_root}/index.html" << 'EOF'
+    mkdir -p "$nosite_root"
+    cat > "${nosite_root}/nosite.html" << 'NOSITE_EOF'
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ISPConfig installed</title>
+<meta name="robots" content="noindex, nofollow">
+<meta name="color-scheme" content="dark light">
+<title>No site at this address</title>
+<style>
+:root {
+  --bg: #282a36;
+  --bg-elevated: #343746;
+  --fg: #f8f8f2;
+  --fg-muted: #c0c4d6;
+  --accent: #bd93f9;
+  --border: #44475a;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #ffffff;
+    --bg-elevated: #f6f8fa;
+    --fg: #1f2328;
+    --fg-muted: #57606a;
+    --accent: #0969da;
+    --border: #d0d7de;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+main {
+  width: 100%;
+  max-width: 34rem;
+  padding: 2.5rem 2rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  text-align: center;
+}
+.code {
+  margin: 0;
+  font-size: clamp(3.5rem, 18vw, 6rem);
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+}
+h1 { margin: 1rem 0 0.75rem; font-size: 1.5rem; }
+p { margin: 0 0 1rem; color: var(--fg-muted); }
+hr { border: 0; border-top: 1px solid var(--border); margin: 1.5rem 0; }
+.hint { margin: 0; font-size: 0.9rem; }
+</style>
 </head>
 <body>
-<h1>ISPConfig is installed</h1>
-<p>This server has no default website configured yet.</p>
-<p>Point a domain at this IP and create a website in the ISPConfig panel to replace this page.</p>
-<p>Control panel: see <code>/root/ispconfig_installation_summary.txt</code> on the server for the URL.</p>
+<main>
+  <p class="code">404</p>
+  <h1>No site at this address</h1>
+  <p>This server is online, but no website has been set up for this domain name.</p>
+  <hr>
+  <p class="hint">Visitors: check the address for typos, or contact the site owner.</p>
+  <p class="hint">Site owners: add this domain as a website in your hosting control panel and make sure its DNS records point to this server.</p>
+</main>
 </body>
 </html>
-EOF
-        chown "${NGINX_USER}:${NGINX_USER}" "${web_root}/index.html" 2>/dev/null || true
-        chmod 644 "${web_root}/index.html"
-        __log "Replaced the distro default page with an ISPConfig holding page"
-    fi
+NOSITE_EOF
+    chown -R root:root "$nosite_root"
+    chmod 755 "$nosite_root"
+    chmod 644 "${nosite_root}/nosite.html"
+
+    cat > "$nosite_conf" << NOSITE_VHOST_EOF
+# Default vhost: answers 404 for any Host that matches no hosted site.
+<VirtualHost ${APACHE_BACKEND_IP}:${APACHE_BACKEND_PORT}>
+    ServerName nosite.invalid
+    DocumentRoot ${nosite_root}
+    ErrorDocument 404 /nosite.html
+    RedirectMatch 404 "^/(?!nosite\.html\$)"
+    <Directory ${nosite_root}>
+        Require all granted
+        Options None
+        AllowOverride None
+    </Directory>
+</VirtualHost>
+NOSITE_VHOST_EOF
+
+    case "$PACKAGE_MANAGER" in
+        apt) a2ensite 00-ispconfig-nosite >/dev/null ;;
+    esac
+
+    apachectl configtest
+    systemctl reload "${APACHE_SERVICE}"
+    __log "No-site catch-all page installed (${nosite_conf})"
+}
+
+__create_php_test_script() {
+    local web_root="/var/www/html"
+    [[ "$DISTRO" =~ ^(opensuse|sles) ]] && web_root="/srv/www/htdocs"
 
     # phpinfo() in a publicly reachable document root discloses the full PHP
     # build, loaded modules, environment and every *_PASSWD superglobal. It is
@@ -2243,6 +2333,7 @@ __main() {
     __step "Configuring public mail records"   __configure_mail_public
     __step "Configuring SSL"                   __configure_ssl
 
+    __step "Installing no-site catch-all page" __configure_nosite_page
     __step "Finalizing configuration"          __final_configuration
     __create_summary
 
