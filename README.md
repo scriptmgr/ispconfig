@@ -15,6 +15,8 @@ bash install.sh
 
 The script must be run as root. It detects your distribution automatically and requires no configuration. Credentials are generated automatically unless you provide overrides through environment variables.
 
+The installer is for fresh servers: if ISPConfig is already installed (`/usr/local/ispconfig`), it stops immediately instead of regenerating credentials that would no longer match the running system.
+
 Output is one line per install step (with a spinner while it runs) — package-manager noise is captured, not streamed. A step that fails prints `[FAILED]` plus the last 40 lines of its captured log and stops the script.
 
 **If you're connecting over SSH, run it inside `tmux`/`screen`.** The first step is a full system upgrade, which can restart `sshd`/`systemd`/`dbus` (directly or via an auto-restart hook like `needrestart`) and kill the SSH session running the script — a terminal multiplexer survives that. The script warns if it detects SSH without one, but running inside `tmux new -s ispconfig` or `screen -S ispconfig` up front avoids the interruption entirely.
@@ -41,7 +43,7 @@ ISPCONFIG_DB_PASSWORD='choose-a-third-strong-password' \
 bash install.sh
 ```
 
-Choose passwords that are safe to embed in SQL strings; avoid single quotes. The installer writes the resulting credentials to `/root/ispconfig_installation_summary.txt` with mode `0600`.
+Passwords may not contain quotes, backslashes, backticks, dollar signs or whitespace, and `ISPCONFIG_ADMIN_USER` may contain only letters, digits, `.`, `_` and `-`; the installer rejects anything else before it changes the system. The installer writes the resulting credentials to `/root/ispconfig_installation_summary.txt` with mode `0600`.
 
 ---
 
@@ -152,7 +154,7 @@ To generate it for testing, set `ISPCONFIG_PHPINFO=1` before running the install
 sudo env ISPCONFIG_PHPINFO=1 bash install.sh
 ```
 
-Visit `http://<server-ip>/phpinfo.php` to list all installed PHP versions and confirm `X-Forwarded-Proto` passthrough. **Remove it before going live** (`rm -f /var/www/html/phpinfo.php`).
+Visit `https://<server-ip>/phpinfo.php` (self-signed certificate) to list all installed PHP versions and confirm `X-Forwarded-Proto` passthrough. The page is served by the catch-all no-site vhost; the 404 rule lets only `phpinfo.php` through. **Remove it before going live** (`rm -f /var/www/ispconfig-nosite/phpinfo.php`).
 
 ---
 

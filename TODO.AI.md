@@ -1,18 +1,18 @@
 # TODO.AI.md — ispconfig
 
-Open items only. Every defect from the first AlmaLinux 9.8 VM run (silent
-`[OK]` on failed steps, SELinux port/label/boolean gaps, panel `db_host`,
-mod_fcgid 500, `postalias` label, vlogger log directory) is fixed and was
-verified on a clean VM. The installer deliberately configures no firewall;
-that is the sysadmin's / ISPConfig's job, not a defect.
+Open items only. All defects found so far are fixed and were verified on clean
+VMs. The installer deliberately configures no firewall; that is the
+sysadmin's / ISPConfig's job, not a defect.
 
-## Verification
+## Verification gaps
 
-- Re-run the full clean-VM install after the catch-all page change and confirm
-  `https://<ip>/` answers `404` with the "No site at this address" page and a
-  hosted site still resolves by Host header.
+- Not tested: a host that already runs MariaDB with an unknown root password
+  (needs service control the test harness could not use). The installer should
+  fail loudly there; confirm on a disposable VM.
+- Not tested: openSUSE, Fedora, CentOS/RHEL 7-8, Ubuntu 18/20, Debian 9-11.
+  Only AlmaLinux 9, Rocky 9, Debian 12/13 and Ubuntu 22.04/24.04 were run.
 
 ## Lint
 
-- Pre-existing script-lint notes: over-long lines, two UUOC pipelines, and
-  shellcheck SC2154 / SC2034 / SC2086 findings.
+- `install.sh` line 528 (nginx `ssl_ciphers`, 232 chars) exceeds 180: a single
+  directive that cannot be wrapped.

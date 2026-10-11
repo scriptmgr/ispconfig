@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202610090047-git
+##@Version           :  202610102159-git
 # @@Author           :  ISPConfig Universal Installer Contributors
 # @@Contact          :  https://github.com/scriptmgr/ispconfig
 # @@License          :  MIT
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202610090047-git"
+VERSION="202610102159-git"
 
 # Universal ISPConfig Installation Script
 # Architecture: Nginx (frontend, SSL termination) → Apache (backend, 127.0.0.1:81)
@@ -38,6 +38,19 @@ NC='\033[0m'
 CLR_EOL='\033[K'
 
 # ── Global variables ──────────────────────────────────────────────────────────
+# Package scripts must never prompt (postfix, tzdata, needrestart, ...). Set
+# globally: __step runs each phase in a subshell, so an export made inside one
+# step would not reach the next.
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export APT_LISTCHANGES_FRONTEND=none
+
+# __step runs each phase in a subshell, so variables a phase discovers at
+# runtime (PHP_DEFAULT, Apache ports) are written here with __save_var and
+# re-read by __step after the phase succeeds.
+STATE_FILE=""
+NOSITE_PHPINFO=0
+
 ADMIN_PORT=64245
 ISPCONFIG_MYSQL_ROOT_PASSWORD="${ISPCONFIG_MYSQL_ROOT_PASSWORD:-}"
 ISPCONFIG_ADMIN_PASSWORD="${ISPCONFIG_ADMIN_PASSWORD:-}"
@@ -101,6 +114,11 @@ __spin() {
 # Runs a function quietly: stdout/stderr are captured to a temp log instead
 # of streaming to the terminal, a spinner shows progress, and the result
 # collapses to one line — "[OK]" on success, or __failed's report on failure.
+__save_var() {
+    [[ -n "$STATE_FILE" ]] && printf '%s=%q\n' "$1" "${!1}" >> "$STATE_FILE"
+    return 0
+}
+
 __step() {
     local desc="$1"; shift
     local logfile spin_pid rc
@@ -122,6 +140,8 @@ __step() {
         wait "$spin_pid" 2>/dev/null || true
     fi
     if [[ $rc -eq 0 ]]; then
+        # shellcheck disable=SC1090
+        [[ -n "$STATE_FILE" && -s "$STATE_FILE" ]] && source "$STATE_FILE"
         printf "\r%s ${GREEN}[OK]${NC}${CLR_EOL}\n" "$desc"
         rm -f "$logfile"
     else
@@ -144,6 +164,16 @@ __check_session_safety() {
     if [[ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" && -z "${TMUX:-}${STY:-}" ]]; then
         __warn "Running over SSH without tmux/screen. The system-update step can restart sshd/systemd and drop this session mid-install."
         __warn "Recommended: re-run inside 'tmux new -s ispconfig' or 'screen -S ispconfig'."
+    fi
+}
+
+# A second run on an installed server would reset the MySQL root password and
+# print new credentials while the ISPConfig DB user and panel admin keep the
+# old ones, leaving the summary wrong. Refuse to run instead.
+__check_existing_install() {
+    if [[ -f /usr/local/ispconfig/interface/lib/config.inc.php ]]; then
+        __error "ISPConfig is already installed (/usr/local/ispconfig). This installer is for fresh servers only; \
+existing credentials are in /root/ispconfig_installation_summary.txt"
     fi
 }
 
@@ -241,7 +271,23 @@ Supported: Ubuntu 18-26, Debian 9-13, CentOS/RHEL 7-9, AlmaLinux/Rocky 8-10, Fed
 }
 
 # ── Passwords ─────────────────────────────────────────────────────────────────
+# Supplied credentials are embedded in SQL strings, PHP config and the
+# ISPConfig answer file, so characters that would break any of those are
+# rejected up front rather than corrupting the install halfway through.
+__validate_credential() {
+    local name="$1" value="$2"
+    if [[ -n "$value" && "$value" =~ [\'\"\\\`\$[:space:]] ]]; then
+        __error "${name} contains an unsupported character (quote, backslash, backtick, dollar sign or whitespace)"
+    fi
+}
+
 __generate_passwords() {
+    __validate_credential ISPCONFIG_MYSQL_ROOT_PASSWORD "$ISPCONFIG_MYSQL_ROOT_PASSWORD"
+    __validate_credential ISPCONFIG_ADMIN_PASSWORD "$ISPCONFIG_ADMIN_PASSWORD"
+    __validate_credential ISPCONFIG_DB_PASSWORD "$ISPCONFIG_DB_PASSWORD"
+    if [[ -n "$ISPCONFIG_ADMIN_USER" && ! "$ISPCONFIG_ADMIN_USER" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        __error "ISPCONFIG_ADMIN_USER may contain only letters, digits, dot, underscore and hyphen"
+    fi
     if [[ -z "$ISPCONFIG_MYSQL_ROOT_PASSWORD" ]]; then
         ISPCONFIG_MYSQL_ROOT_PASSWORD=$(openssl rand -base64 32)
         __log "Generated MySQL root password"
@@ -334,8 +380,31 @@ __install_base_packages() {
 }
 
 # ── Nginx install + config ────────────────────────────────────────────────────
+# nginx 1.25.1 deprecated "listen ... http2" in favour of a separate
+# "http2 on;" directive, which older releases do not know. Pick the form the
+# installed nginx understands so neither a warning nor a config error appears.
+NGINX_H2_LISTEN=" http2"
+NGINX_H2_DIRECTIVE=""
+__nginx_http2_form() {
+    local ver
+    ver=$(nginx -v 2>&1 | sed -n 's|.*nginx/\([0-9][0-9.]*\).*|\1|p')
+    if [[ -n "$ver" && "$(printf '%s\n1.25.1\n' "$ver" | sort -V | head -n1)" == "1.25.1" ]]; then
+        NGINX_H2_LISTEN=""
+        NGINX_H2_DIRECTIVE="    http2       on;"
+    fi
+}
+
 __install_nginx() {
     __log "Installing Nginx..."
+
+    # The configuration below replaces /etc/nginx wholesale. If nginx was
+    # already configured on this host, keep a copy so nothing is lost.
+    local nginx_backup=""
+    if [[ -f /etc/nginx/nginx.conf ]]; then
+        nginx_backup="/etc/nginx.pre-ispconfig.$(date +%Y%m%d%H%M%S)"
+        cp -a /etc/nginx "$nginx_backup"
+        __warn "Existing /etc/nginx backed up to ${nginx_backup} before being replaced"
+    fi
     case "$PACKAGE_MANAGER" in
         "apt")
             apt-get install -y nginx
@@ -361,12 +430,17 @@ __install_nginx() {
     mkdir -p "$LETSENCRYPT_WEBROOT/.well-known/acme-challenge"
     chown -R "$NGINX_USER:$NGINX_USER" "$LETSENCRYPT_WEBROOT" 2>/dev/null || true
 
+    # The file-descriptor limit comes from systemd, not worker_rlimit_nofile:
+    # SELinux denies nginx workers setrlimit(), which logs an alert per worker.
+    mkdir -p /etc/systemd/system/nginx.service.d
+    printf '[Service]\nLimitNOFILE=131072\n' > /etc/systemd/system/nginx.service.d/limits.conf
+    systemctl daemon-reload
+
     # ── nginx.conf ────────────────────────────────────────────────────────────
     cat > /etc/nginx/nginx.conf << 'NGINX_EOF'
 user NGINX_USER_PLACEHOLDER;
 worker_processes auto;
 worker_cpu_affinity auto;
-worker_rlimit_nofile 65535;
 pid /run/nginx.pid;
 
 events {
@@ -491,6 +565,8 @@ NGINX_EOF
         -e "s|NGINX_VHOSTS_DIR_PLACEHOLDER|${NGINX_VHOSTS_DIR}|g" \
         /etc/nginx/nginx.conf
 
+    __nginx_http2_form
+
     # ── vhosts.d/00-redirect-http.conf ───────────────────────────────────────
     cat > "${NGINX_VHOSTS_DIR}/00-redirect-http.conf" << VHOST_EOF
 server {
@@ -514,8 +590,9 @@ VHOST_EOF
     # ── vhosts.d/00-default-https.conf ───────────────────────────────────────
     cat > "${NGINX_VHOSTS_DIR}/00-default-https.conf" << VHOST_EOF
 server {
-    listen      443 ssl http2 default_server;
-    listen      [::]:443 ssl http2 default_server;
+    listen      443 ssl${NGINX_H2_LISTEN} default_server;
+    listen      [::]:443 ssl${NGINX_H2_LISTEN} default_server;
+${NGINX_H2_DIRECTIVE}
     server_name _;
 
     ssl_certificate     ${SSL_DIR}/default.crt;
@@ -721,6 +798,7 @@ __install_php_debian() {
     for version in "${PHP_VERSIONS[@]}"; do
         if [[ -x "/usr/bin/php${version}" ]]; then
             PHP_DEFAULT="$version"
+            __save_var PHP_DEFAULT
             break
         fi
     done
@@ -771,6 +849,7 @@ __install_php_rhel() {
         local vc="${version//./}"
         if [[ -x "/opt/remi/php${vc}/root/usr/bin/php" ]]; then
             PHP_DEFAULT="$version"
+            __save_var PHP_DEFAULT
             break
         fi
     done
@@ -1026,8 +1105,17 @@ TRUSTEOF
         postconf -e "non_smtpd_milters = inet:localhost:8891"
     fi
 
+    # Debian's init wrapper reads /etc/default/opendkim and its SOCKET value
+    # overrides the Socket line in opendkim.conf, leaving the daemon on a unix
+    # socket while Postfix's milter points at inet:localhost:8891.
+    if [[ -f /etc/default/opendkim ]]; then
+        sed -i -e '/^[[:space:]]*#\?[[:space:]]*SOCKET=/d' /etc/default/opendkim
+        echo 'SOCKET=inet:8891@localhost' >> /etc/default/opendkim
+    fi
+
     systemctl enable opendkim 2>/dev/null || true
-    systemctl start  opendkim 2>/dev/null || true
+    # restart, not start: Debian starts the daemon at package install time
+    systemctl restart opendkim 2>/dev/null || true
 
     systemctl restart postfix dovecot 2>/dev/null || true
     __success "Mail configured: SMTP/S + submission + IMAP/S + POP3/S + DKIM framework"
@@ -1284,19 +1372,22 @@ EOF
         __log "Renamed ISPConfig admin user to '${ISPCONFIG_ADMIN_USER}'"
     fi
 
-    # The panel reads its DB settings from lib/config.inc.php, but autoinstall.ini
-    # gave us db_host=127.0.0.1 while the GRANT it created is for the server
-    # FQDN. MariaDB resolves 127.0.0.1 to 'localhost', finds no matching grant,
-    # and the panel dies with "queryOneRecord() on false". Point db_host at the
-    # same FQDN the grant was issued for.
-    local ispc_config="/usr/local/ispconfig/interface/lib/config.inc.php"
-    if [[ -f "$ispc_config" ]]; then
-        sed -i -e "s|\\\$conf\['db_host'\] = '[^']*'|\\\$conf['db_host'] = '${HOSTNAME}'|" \
-            "$ispc_config"
-        __log "Set panel db_host to ${HOSTNAME} (matches the GRANT issued at install)"
-    else
-        __warn "${ispc_config} not found — panel DB host left as-is"
-    fi
+    # The panel, ISPConfig's server scripts, Postfix's MySQL maps and amavisd
+    # all connect to 127.0.0.1, which MariaDB sees as 'localhost'. The
+    # autoinstaller only grants the server FQDN, so every connection was denied
+    # (panel 500, local mail deferred, amavisd dying on each message). Pointing
+    # db_host at the FQDN instead is fragile: it can resolve to an IPv6
+    # link-local address that MariaDB does not listen on. Grant the loopback
+    # host names the same privileges instead.
+    local grant_bin="mysql"
+    command -v mariadb >/dev/null 2>&1 && grant_bin="mariadb"
+    local grant_host
+    for grant_host in localhost 127.0.0.1; do
+        local grant_sql="CREATE USER IF NOT EXISTS 'ispconfig'@'${grant_host}' IDENTIFIED BY '${ISPCONFIG_DB_PASSWORD}';"
+        grant_sql+=" GRANT SELECT, INSERT, UPDATE, DELETE ON dbispconfig.* TO 'ispconfig'@'${grant_host}'; FLUSH PRIVILEGES;"
+        "$grant_bin" -u root -p"${ISPCONFIG_MYSQL_ROOT_PASSWORD}" -e "$grant_sql"
+    done
+    __log "Granted the ispconfig DB user access from localhost and 127.0.0.1"
 }
 
 # ── Apache backend hardening (runs after ISPConfig install) ──────────────────
@@ -1379,7 +1470,9 @@ FWDEOF
             [[ -z "$php_cgi_bin" ]] && php_cgi_bin=$(command -v "php-cgi${PHP_DEFAULT}" || command -v php-cgi 2>/dev/null)
             if [[ -n "$php_cgi_bin" ]]; then
                 local php_ver_dir
-                php_ver_dir=$(dirname "$(readlink -f "$php_cgi_bin")" 2>/dev/null | sed 's|/bin$||')
+                php_ver_dir=$(readlink -f "$php_cgi_bin" 2>/dev/null) || php_ver_dir=""
+                php_ver_dir="${php_ver_dir%/*}"
+                php_ver_dir="${php_ver_dir%/bin}"
                 # Extract version from binary name (php-cgi does not support -r; use path parsing)
                 local php_ver
                 php_ver=$(printf '%s' "${php_cgi_bin##*/}" | grep -oE -- '[0-9]+\.[0-9]+' | head -1)
@@ -1438,6 +1531,8 @@ FWDEOF
             [[ -n "$suse_admin_port" ]] && APACHE_ADMIN_PORT="$suse_admin_port"
             [[ -n "$suse_apps_port"  ]] && APACHE_APPS_PORT="$suse_apps_port"
             __log "ISPConfig panel port: ${APACHE_ADMIN_PORT}, apps port: ${APACHE_APPS_PORT}"
+            __save_var APACHE_ADMIN_PORT
+            __save_var APACHE_APPS_PORT
 
             # Replace ALL Listen directives in httpd.conf with our loopback-only set.
             sed -i '/^[[:space:]]*Listen /d' "${APACHE_CONF_DIR}/httpd.conf"
@@ -1536,6 +1631,8 @@ MPMEOF
             [[ -n "$ispc_admin_port" ]] && APACHE_ADMIN_PORT="$ispc_admin_port"
             [[ -n "$ispc_apps_port"  ]] && APACHE_APPS_PORT="$ispc_apps_port"
             __log "ISPConfig panel port: ${APACHE_ADMIN_PORT}, apps port: ${APACHE_APPS_PORT}"
+            __save_var APACHE_ADMIN_PORT
+            __save_var APACHE_APPS_PORT
 
             # Replace public listeners and remove the obsolete Apache 2.2 vhost directive.
             # ISPConfig's vhost files also carry Listen lines which are stripped below.
@@ -1719,6 +1816,10 @@ __configure_selinux() {
     semanage fcontext -a -t postfix_etc_t "/var/lib/aliases(/.*)?" 2>/dev/null \
         || semanage fcontext -m -t postfix_etc_t "/var/lib/aliases(/.*)?" 2>/dev/null || true
 
+    # 6b. postfix reads the mailman maps ISPConfig creates here, and must traverse the directory.
+    semanage fcontext -a -t postfix_etc_t "/var/lib/mailman(/data(/.*)?)?" 2>/dev/null \
+        || semanage fcontext -m -t postfix_etc_t "/var/lib/mailman(/data(/.*)?)?" 2>/dev/null || true
+
     # 7. PHP's OPcache locks a memfd shared-memory segment. Under
     #    httpd_sys_script_t that memfd is typed tmpfs_t and the lock is denied,
     #    which kills the FastCGI child before it can emit headers (HTTP 500 on
@@ -1744,7 +1845,7 @@ __configure_selinux() {
         __log "Disabled OPcache for CGI (${_ini})"
     done
 
-    restorecon -R /usr/local/ispconfig /var/log/ispconfig /var/www/php-fcgi-scripts 2>/dev/null || true
+    restorecon -R /usr/local/ispconfig /var/log/ispconfig /var/www/php-fcgi-scripts /var/lib/mailman "$LETSENCRYPT_WEBROOT" 2>/dev/null || true
 
     __success "SELinux policy applied (ports, booleans, file contexts)"
 }
@@ -1775,11 +1876,14 @@ __configure_ispconfig_nginx() {
         __log "ISPConfig Apache templates patched"
     fi
 
+    __nginx_http2_form
+
     # nginx vhost for ISPConfig admin panel (port ADMIN_PORT → Apache admin port)
     cat > "${NGINX_VHOSTS_DIR}/ispconfig-panel.conf" << VHOST_EOF
 server {
-    listen      ${ADMIN_PORT} ssl http2;
-    listen      [::]:${ADMIN_PORT} ssl http2;
+    listen      ${ADMIN_PORT} ssl${NGINX_H2_LISTEN};
+    listen      [::]:${ADMIN_PORT} ssl${NGINX_H2_LISTEN};
+${NGINX_H2_DIRECTIVE}
     server_name _;
 
     ssl_certificate     ${SSL_DIR}/ispconfig.crt;
@@ -1813,6 +1917,15 @@ VHOSTS_DIR="/etc/nginx/vhosts.d"
 APACHE_BACKEND="127.0.0.1:81"
 cert_count=0
 
+# nginx 1.25.1+ wants "http2 on;" instead of "listen ... http2".
+H2_LISTEN=" http2"
+H2_DIRECTIVE=""
+nginx_ver=$(nginx -v 2>&1 | sed -n 's|.*nginx/\([0-9][0-9.]*\).*|\1|p')
+if [[ -n "$nginx_ver" && "$(printf '%s\n1.25.1\n' "$nginx_ver" | sort -V | head -n1)" == "1.25.1" ]]; then
+    H2_LISTEN=""
+    H2_DIRECTIVE="    http2       on;"
+fi
+
 # Stapling needs both an OCSP responder in the certificate and a local CA bundle.
 CA_BUNDLE=""
 for c in /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt \
@@ -1839,8 +1952,9 @@ for cert_dir in /etc/letsencrypt/live/*/; do
     fi
 
     new_content="server {
-    listen      443 ssl http2;
-    listen      [::]:443 ssl http2;
+    listen      443 ssl${H2_LISTEN};
+    listen      [::]:443 ssl${H2_LISTEN};
+${H2_DIRECTIVE}
     server_name ${domain} www.${domain};
 
     ssl_certificate     ${fullchain};
@@ -1920,9 +2034,26 @@ __configure_ssl() {
 
 # ── Final configuration ───────────────────────────────────────────────────────
 # ── amavisd repair ─────────────────────────────────────────────────────────────
+# RHEL-family and SUSE ship /etc/amavisd + amavisd.service; Debian-family ship
+# /etc/amavis + amavis.service. Sets AMAVIS_CONF_DIR/AMAVIS_SERVICE, or leaves
+# AMAVIS_CONF_DIR empty when amavis is not installed.
+AMAVIS_CONF_DIR=""
+AMAVIS_SERVICE=""
+__amavis_detect() {
+    AMAVIS_CONF_DIR=""
+    if [[ -d /etc/amavisd ]]; then
+        AMAVIS_CONF_DIR="/etc/amavisd"
+        AMAVIS_SERVICE="amavisd"
+    elif [[ -d /etc/amavis ]]; then
+        AMAVIS_CONF_DIR="/etc/amavis"
+        AMAVIS_SERVICE="amavis"
+    fi
+}
+
 __fixup_amavisd() {
     # amavisd is optional; nothing to do when the package is absent.
-    [[ -d /etc/amavisd ]] || return 0
+    __amavis_detect
+    [[ -n "$AMAVIS_CONF_DIR" ]] || return 0
 
     __log "Repairing amavisd installation..."
 
@@ -1930,7 +2061,10 @@ __fixup_amavisd() {
     #    and amavisd hard-exits with "MISSING REQUIRED ADDITIONAL MODULES"
     #    before it ever binds a socket.
     if ! perl -MDBD::mysql -e1 2>/dev/null; then
-        __try_install "$PACKAGE_MANAGER" perl-DBI perl-DBD-mysql \
+        local dbd_pkgs="perl-DBI perl-DBD-mysql"
+        [[ "$PACKAGE_MANAGER" == "apt" ]] && dbd_pkgs="libdbi-perl libdbd-mysql-perl"
+        # shellcheck disable=SC2086
+        __try_install "$PACKAGE_MANAGER" $dbd_pkgs \
             || __warn "amavisd: perl DBD::mysql unavailable — amavisd will not start"
     fi
 
@@ -1938,8 +2072,8 @@ __fixup_amavisd() {
     #    0640 but leaves the group as root. amavisd drops to $daemon_user
     #    (amavis), so it falls into the "other" class and gets EACCES on its
     #    own config. Restore group-read for the amavis group across the tree.
-    chgrp -R amavis /etc/amavisd 2>/dev/null || true
-    find /etc/amavisd -type f -exec chmod g+r,o-r {} + 2>/dev/null || true
+    chgrp -R amavis "$AMAVIS_CONF_DIR" 2>/dev/null || true
+    find "$AMAVIS_CONF_DIR" -type f -exec chmod g+r,o-r {} + 2>/dev/null || true
 
     # 3. SELinux: amavisd runs as antivirus_exec_t but ports 10026/10027 ship
     #    as spamd_port_t, so it cannot bind its own nanny port and dies with
@@ -1951,15 +2085,15 @@ __fixup_amavisd() {
             semanage port -a -t amavisd_recv_port_t -p tcp "$p" 2>/dev/null \
                 || semanage port -m -t amavisd_recv_port_t -p tcp "$p" 2>/dev/null || true
         done
-        restorecon -R /etc/amavisd 2>/dev/null || true
+        restorecon -R "$AMAVIS_CONF_DIR" 2>/dev/null || true
     fi
 
     # 4. The package ships disabled, so on a real reboot amavisd never comes up
     #    and Postfix's content_filter points at a dead port.
-    systemctl enable amavisd 2>/dev/null || true
-    systemctl reset-failed amavisd 2>/dev/null || true
-    systemctl restart amavisd 2>/dev/null \
-        || __warn "amavisd failed to start — check: journalctl -u amavisd"
+    systemctl enable "$AMAVIS_SERVICE" 2>/dev/null || true
+    systemctl reset-failed "$AMAVIS_SERVICE" 2>/dev/null || true
+    systemctl restart "$AMAVIS_SERVICE" 2>/dev/null \
+        || __warn "${AMAVIS_SERVICE} failed to start — check: journalctl -u ${AMAVIS_SERVICE}"
 
     __success "amavisd configuration repaired"
 }
@@ -2026,9 +2160,20 @@ __verify_services() {
 
     # amavisd only when the package is present. Postfix's content_filter points
     # at 127.0.0.1:10024, so a dead amavisd silently breaks the mail path.
-    if [[ -d /etc/amavisd ]]; then
-        systemctl is-active --quiet amavisd || failed+=("amavisd")
+    __amavis_detect
+    if [[ -n "$AMAVIS_CONF_DIR" ]]; then
+        systemctl is-active --quiet "$AMAVIS_SERVICE" || failed+=("$AMAVIS_SERVICE")
     fi
+
+    # Every Postfix MySQL map must answer a lookup (exit 0 = hit, 1 = no match);
+    # anything else means the DB grant or credentials are wrong and mail defers.
+    local map rc
+    for map in /etc/postfix/mysql-*.cf; do
+        [[ -f "$map" ]] || continue
+        rc=0
+        postmap -q "probe@verify.invalid" "mysql:${map}" >/dev/null 2>&1 || rc=$?
+        ((rc <= 1)) || failed+=("postfix-map:${map##*/}")
+    done
 
     if ((${#failed[@]} > 0)); then
         __error "Service(s) not running after install: ${failed[*]}"
@@ -2043,13 +2188,14 @@ __verify_services() {
     # connection was refused; 5xx means the proxy chain is broken.
     local code
     code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 \
-        "https://${APACHE_BACKEND_IP}:${ADMIN_PORT}/" 2>/dev/null || echo 000)
+        "https://${APACHE_BACKEND_IP}:${ADMIN_PORT}/" 2>/dev/null) || true
+    code="${code:-000}"
     case "$code" in
         200|30[0-9])
             __log "ISPConfig panel responding (HTTP ${code})"
             ;;
         000)
-            __error "ISPConfig panel unreachable on https://${APACHE_BACKEND_IP}:${ADMIN_PORT}/ (connection refused)"
+            __error "ISPConfig panel unreachable on https://${APACHE_BACKEND_IP}:${ADMIN_PORT}/ (no response)"
             return 1
             ;;
         *)
@@ -2147,13 +2293,35 @@ NOSITE_EOF
     chmod 755 "$nosite_root"
     chmod 644 "${nosite_root}/nosite.html"
 
+    # Opt-in diagnostic page (ISPCONFIG_PHPINFO=1): let phpinfo.php through the
+    # 404 rule and run it through the first php-fpm socket that exists. With no
+    # socket it stays blocked rather than being served as plain text.
+    local allowed_re='nosite\.html' php_handler="" sock
+    NOSITE_PHPINFO=0
+    if [[ "${ISPCONFIG_PHPINFO:-0}" == "1" ]]; then
+        for sock in "/var/opt/remi/php${PHP_DEFAULT//./}/run/php-fpm/www.sock" \
+                    "/run/php/php${PHP_DEFAULT}-fpm.sock" /run/php-fpm/www.sock; do
+            [[ -S "$sock" ]] || continue
+            [[ "$PACKAGE_MANAGER" == "apt" ]] && a2enmod proxy proxy_fcgi >/dev/null
+            allowed_re='nosite\.html|phpinfo\.php'
+            php_handler="    <Files \"phpinfo.php\">
+        SetHandler \"proxy:unix:${sock}|fcgi://localhost\"
+    </Files>"
+            NOSITE_PHPINFO=1
+            break
+        done
+        [[ $NOSITE_PHPINFO -eq 1 ]] || __warn "ISPCONFIG_PHPINFO=1 but no php-fpm socket found — phpinfo.php not enabled"
+    fi
+    __save_var NOSITE_PHPINFO
+
     cat > "$nosite_conf" << NOSITE_VHOST_EOF
 # Default vhost: answers 404 for any Host that matches no hosted site.
 <VirtualHost ${APACHE_BACKEND_IP}:${APACHE_BACKEND_PORT}>
     ServerName nosite.invalid
     DocumentRoot ${nosite_root}
     ErrorDocument 404 /nosite.html
-    RedirectMatch 404 "^/(?!nosite\.html\$)"
+    RedirectMatch 404 "^/(?!(${allowed_re})\$)"
+${php_handler}
     <Directory ${nosite_root}>
         Require all granted
         Options None
@@ -2172,13 +2340,12 @@ NOSITE_VHOST_EOF
 }
 
 __create_php_test_script() {
-    local web_root="/var/www/html"
-    [[ "$DISTRO" =~ ^(opensuse|sles) ]] && web_root="/srv/www/htdocs"
+    local web_root="/var/www/ispconfig-nosite"
 
     # phpinfo() in a publicly reachable document root discloses the full PHP
     # build, loaded modules, environment and every *_PASSWD superglobal. It is
     # a diagnostic aid, not a default. Opt in with ISPCONFIG_PHPINFO=1.
-    if [[ "${ISPCONFIG_PHPINFO:-0}" != "1" ]]; then
+    if [[ "${ISPCONFIG_PHPINFO:-0}" != "1" || "${NOSITE_PHPINFO:-0}" != "1" ]]; then
         rm -f "${web_root}/phpinfo.php"
         __log "phpinfo.php not created (set ISPCONFIG_PHPINFO=1 to enable)"
         return 0
@@ -2308,7 +2475,9 @@ __main() {
     echo "============================================"
     echo -e "${NC}"
 
+    STATE_FILE=$(mktemp /tmp/ispconfig-state.XXXXXX)
     __check_root
+    __check_existing_install
     __check_session_safety
     __detect_distro
     __generate_passwords
@@ -2370,6 +2539,7 @@ __main() {
     __log "ISPConfig DB pass:  ${db_pass}"
     __warn "Credentials saved to: /root/ispconfig_installation_summary.txt"
     echo -e "${NC}"
+    rm -f "$STATE_FILE"
 }
 
 __main "$@"
