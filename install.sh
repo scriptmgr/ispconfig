@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202610102159-git
+##@Version           :  202610111924-git
 # @@Author           :  ISPConfig Universal Installer Contributors
 # @@Contact          :  https://github.com/scriptmgr/ispconfig
 # @@License          :  MIT
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202610102159-git"
+VERSION="202610111924-git"
 
 # Universal ISPConfig Installation Script
 # Architecture: Nginx (frontend, SSL termination) → Apache (backend, 127.0.0.1:81)
@@ -128,12 +128,16 @@ __step() {
         spin_pid=$!
     fi
     trap 'ec=$?; [[ -n "${spin_pid:-}" ]] && kill "$spin_pid" 2>/dev/null; __failed "$desc" "$logfile" "$ec"' EXIT
-    # The function must run in a subshell, NOT as `if { "$@"; }`. In a
-    # condition context bash suspends set -e for the whole function body, so a
-    # mid-function failure is silently discarded and only the last command's
-    # status reaches us — a step could fail halfway and still report [OK].
-    # Running it as a plain command in a subshell keeps set -e armed inside.
-    ( "$@" ) >"$logfile" 2>&1 && rc=0 || rc=$?
+    # The body must run in a subshell with set -e armed. Neither `if { "$@"; }`
+    # nor `( "$@" ) && ... || ...` works: bash suspends set -e for everything
+    # inside a condition or an and/or list, so a mid-function failure would be
+    # discarded and only the last command's status would reach us. Run it as a
+    # plain command with set -e set explicitly, and capture its status with
+    # set +e around the call so this shell survives a failing step.
+    set +e
+    ( set -e; "$@" ) >"$logfile" 2>&1
+    rc=$?
+    set -e
     trap - EXIT
     if [[ -n "${spin_pid:-}" ]]; then
         kill "$spin_pid" 2>/dev/null || true
@@ -171,10 +175,13 @@ __check_session_safety() {
 # print new credentials while the ISPConfig DB user and panel admin keep the
 # old ones, leaving the summary wrong. Refuse to run instead.
 __check_existing_install() {
-    if [[ -f /usr/local/ispconfig/interface/lib/config.inc.php ]]; then
+    [[ -f /usr/local/ispconfig/interface/lib/config.inc.php ]] || return 0
+    if [[ -f /root/ispconfig_installation_summary.txt ]]; then
         __error "ISPConfig is already installed (/usr/local/ispconfig). This installer is for fresh servers only; \
 existing credentials are in /root/ispconfig_installation_summary.txt"
     fi
+    __error "A previous run installed ISPConfig (/usr/local/ispconfig) but did not finish, so no credentials were saved. \
+Re-run on a fresh server, or remove /usr/local/ispconfig and drop the dbispconfig database first"
 }
 
 # ── Distro detection ──────────────────────────────────────────────────────────
@@ -341,6 +348,9 @@ __update_system() {
     case "$PACKAGE_MANAGER" in
         "apt")
             export DEBIAN_FRONTEND=noninteractive
+            # A previous upgrade or reboot can leave packages unpacked but not
+            # configured; apt refuses to do anything until that is finished.
+            dpkg --configure -a
             apt-get update -y
             apt-get upgrade -y
             apt-get install -y ca-certificates gnupg lsb-release curl wget
@@ -511,6 +521,9 @@ http {
     proxy_set_header X-Forwarded-Host  $http_host;
     proxy_set_header X-Forwarded-Port  $server_port;
     proxy_set_header Connection "";
+    # A backend Apache with mod_http2 advertises "Upgrade: h2". Forwarding that
+    # to an HTTP/2 client is a protocol violation (stream PROTOCOL_ERROR).
+    proxy_hide_header Upgrade;
     proxy_redirect              off;
     proxy_connect_timeout       60s;
     proxy_send_timeout          60s;
@@ -653,6 +666,80 @@ __install_apache() {
 }
 
 # ── MariaDB ───────────────────────────────────────────────────────────────────
+# A base image's pre-seeded MariaDB layout can stop the server from starting:
+# /var/lib/mysql owned by root, a config mysqld cannot read, or ssl-key/ssl-cert
+# paths pointing at root-only files. Repair what is safe to repair before the
+# first start; the key keeps its mode and gains a read ACL for mysql only.
+__prepare_mariadb() {
+    getent passwd mysql >/dev/null 2>&1 || return 0
+
+    install -d -o mysql -g mysql -m 0755 /var/lib/mysql
+    local logdir
+    for logdir in /var/log/mysql /var/log/mariadb; do
+        [[ -d "$logdir" ]] && chown -R mysql:mysql "$logdir"
+    done
+
+    local cnf
+    for cnf in /etc/my.cnf /etc/mysql/my.cnf; do
+        [[ -f "$cnf" ]] || continue
+        runuser -u mysql -- test -r "$cnf" 2>/dev/null && continue
+        if command -v setfacl >/dev/null 2>&1 && setfacl -m u:mysql:r "$cnf"; then
+            __warn "Granted the mysql user read access to ${cnf} with an ACL"
+        else
+            chgrp mysql "$cnf"
+            chmod 0640 "$cnf"
+            __warn "Changed ${cnf} to root:mysql mode 0640 for mysql access"
+        fi
+        runuser -u mysql -- test -r "$cnf" 2>/dev/null \
+            || __error "The mysql user still cannot read ${cnf}"
+    done
+
+    # [client] ssl-key/ssl-cert apply to every libmysqlclient user: Postfix's
+    # MySQL maps, amavisd, Dovecot, ISPConfig. When they point at a file only
+    # root can read, all of those connections fail. Comment out just those lines
+    # (they are client-certificate settings, unused for loopback connections)
+    # rather than widening access to a private key.
+    local cnfnum cnfpath cnflines unreadable
+    for cnf in /etc/my.cnf /etc/my.cnf.d/*.cnf /etc/mysql/my.cnf /etc/mysql/conf.d/*.cnf \
+               /etc/mysql/mariadb.conf.d/*.cnf; do
+        [[ -f "$cnf" ]] || continue
+        cnflines=()
+        unreadable=0
+        while IFS=$'\t' read -r cnfnum cnfpath; do
+            [[ -n "$cnfnum" ]] || continue
+            cnflines+=("$cnfnum")
+            if [[ -e "$cnfpath" ]] && ! runuser -u nobody -- test -r "$cnfpath" 2>/dev/null; then
+                unreadable=1
+            fi
+        done < <(awk '/^[[:space:]]*\[/ { sect = tolower($0); gsub(/[[:space:]]/, "", sect) }
+            sect ~ /^\[(client|client-server|client-mariadb|mysql)\]/ && /^[[:space:]]*ssl[-_](key|cert|ca)[[:space:]]*=/ {
+                v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v); gsub(/"/, "", v)
+                printf "%d\t%s\n", NR, v }' "$cnf")
+        # All or nothing: a client certificate without its key aborts every
+        # connection during the TLS handshake, root's included.
+        ((unreadable)) || continue
+        [[ -e "${cnf}.pre-ispconfig" ]] || cp -a "$cnf" "${cnf}.pre-ispconfig"
+        for cnfnum in "${cnflines[@]}"; do
+            sed -i "${cnfnum}s|^|# disabled by the ISPConfig installer (unreadable by non-root clients): |" "$cnf"
+        done
+        __warn "Disabled client ssl-key/ssl-cert/ssl-ca lines in ${cnf} (backup: ${cnf}.pre-ispconfig)"
+    done
+
+    local sslfile
+    while read -r sslfile; do
+        [[ -f "$sslfile" ]] || continue
+        runuser -u mysql -- test -r "$sslfile" 2>/dev/null && continue
+        if command -v setfacl >/dev/null 2>&1 && setfacl -m u:mysql:r "$sslfile"; then
+            __warn "MariaDB config uses ${sslfile}; granted the mysql user read access (ACL)"
+        else
+            __warn "MariaDB config uses ${sslfile}, which the mysql user cannot read — MariaDB will not start"
+        fi
+    done < <(grep -hE -- '^[[:space:]]*ssl[-_](key|cert|ca)[[:space:]]*=' \
+        /etc/my.cnf /etc/my.cnf.d/*.cnf /etc/mysql/my.cnf /etc/mysql/conf.d/*.cnf \
+        /etc/mysql/mariadb.conf.d/*.cnf 2>/dev/null \
+        | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]+$//; s/^"(.*)"$/\1/')
+}
+
 __install_mysql() {
     __log "Installing MariaDB server..."
     case "$PACKAGE_MANAGER" in
@@ -661,6 +748,7 @@ __install_mysql() {
         "zypper")    zypper install -y mariadb mariadb-client ;;
     esac
 
+    __prepare_mariadb
     systemctl enable mariadb
     systemctl start mariadb
 
@@ -696,6 +784,11 @@ __install_mysql() {
     # installs. Default MariaDB installs only create root@localhost, so add
     # a root@127.0.0.1 user with the same password for the TCP connection.
     ${MYSQL} -e "CREATE USER IF NOT EXISTS 'root'@'127.0.0.1' IDENTIFIED BY '${ISPCONFIG_MYSQL_ROOT_PASSWORD}'"
+    # On a retry the account already exists with the previous run's password;
+    # CREATE USER IF NOT EXISTS leaves it untouched, so set it explicitly.
+    ${MYSQL} -e "ALTER USER 'root'@'127.0.0.1' IDENTIFIED BY '${ISPCONFIG_MYSQL_ROOT_PASSWORD}'" 2>/dev/null || \
+    ${MYSQL} -e "SET PASSWORD FOR 'root'@'127.0.0.1' = PASSWORD('${ISPCONFIG_MYSQL_ROOT_PASSWORD}')" 2>/dev/null || \
+    ${MYSQL} -e "UPDATE mysql.user SET Password=PASSWORD('${ISPCONFIG_MYSQL_ROOT_PASSWORD}') WHERE User='root' AND Host='127.0.0.1'; FLUSH PRIVILEGES;"
     ${MYSQL} -e "GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION"
 
     ${MYSQL} -e "DELETE FROM mysql.user WHERE User=''"
@@ -735,7 +828,7 @@ __install_php_debian() {
         # packages (e.g. PHP 8.5 ships natively on Ubuntu 26.04).
         local _codename
         _codename=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_CODENAME:-}")
-        if [[ -z "$_codename" ]] || curl -sfI \
+        if [[ -z "$_codename" ]] || curl -q -sfI \
                 "https://ppa.launchpadcontent.net/ondrej/php/ubuntu/dists/${_codename}/Release" \
                 >/dev/null 2>&1; then
             add-apt-repository -y ppa:ondrej/php
@@ -954,7 +1047,12 @@ __configure_mail_public() {
     fi
 
     # Outbound: opportunistic TLS — required by Gmail, Yahoo, Outlook, etc.
-    postconf -e "smtp_tls_security_level = may"
+    # A base config can relay through an smtps (465) relayhost with
+    # smtp_tls_wrappermode=yes; Postfix refuses wrapper mode below "encrypt",
+    # which would defer every outbound message.
+    local smtp_tls_level="may"
+    [[ "$(postconf -h smtp_tls_wrappermode 2>/dev/null)" == "yes" ]] && smtp_tls_level="encrypt"
+    postconf -e "smtp_tls_security_level = ${smtp_tls_level}"
     postconf -e "smtp_tls_loglevel = 1"
     postconf -e "smtp_tls_CAfile = ${SSL_CA_BUNDLE}"
 
@@ -1729,7 +1827,10 @@ RIPEOF
                 done
             fi
 
-            systemctl restart "${APACHE_SERVICE}"
+            # Validate only. Restarting here fails under SELinux enforcing because the
+            # new backend ports are not labelled http_port_t until the next step;
+            # __final_configuration restarts Apache once the policy is applied.
+            apachectl configtest
             ;;
     esac
 
@@ -1894,6 +1995,7 @@ ${NGINX_H2_DIRECTIVE}
     # here and the upstream copies are hidden, so exactly one copy reaches the
     # client regardless of what the panel emits.
     proxy_hide_header Strict-Transport-Security;
+    proxy_hide_header Upgrade;
     proxy_hide_header X-Content-Type-Options;
     proxy_hide_header X-Frame-Options;
     add_header Strict-Transport-Security "max-age=31536000" always;
@@ -2088,6 +2190,57 @@ __fixup_amavisd() {
         restorecon -R "$AMAVIS_CONF_DIR" 2>/dev/null || true
     fi
 
+    # 3b. The amavis transport hands mail to amavisd over plain SMTP on
+    #     127.0.0.1:10024. A global smtp_tls_wrappermode=yes (from a base config)
+    #     would make Postfix attempt TLS on that port and defer all mail.
+    if postconf -M amavis/unix >/dev/null 2>&1; then
+        if ! postconf -P "amavis/unix/smtp_tls_wrappermode=no" \
+                "amavis/unix/smtp_tls_security_level=none" >/dev/null 2>&1; then
+            local master_cf=/etc/postfix/master.cf
+            local master_cf_tmp
+            master_cf_tmp=$(mktemp "${master_cf}.XXXXXX")
+            if awk '
+                function flush_amavis() {
+                    if (!wrapper) print "  -o smtp_tls_wrappermode=no"
+                    if (!security) print "  -o smtp_tls_security_level=none"
+                }
+                /^[[:space:]]*#/ { print; next }
+                /^[^[:space:]]/ {
+                    if (in_amavis) flush_amavis()
+                    in_amavis = ($1 == "amavis" && $2 == "unix")
+                    if (in_amavis) found = 1
+                    wrapper = 0
+                    security = 0
+                    print
+                    next
+                }
+                in_amavis && /^[[:space:]]+-o[[:space:]]+smtp_tls_wrappermode[[:space:]]*=/ {
+                    print "  -o smtp_tls_wrappermode=no"
+                    wrapper = 1
+                    next
+                }
+                in_amavis && /^[[:space:]]+-o[[:space:]]+smtp_tls_security_level[[:space:]]*=/ {
+                    print "  -o smtp_tls_security_level=none"
+                    security = 1
+                    next
+                }
+                { print }
+                END {
+                    if (in_amavis) flush_amavis()
+                    if (!found) exit 42
+                }
+            ' "$master_cf" > "$master_cf_tmp"; then
+                chown --reference="$master_cf" "$master_cf_tmp"
+                chmod --reference="$master_cf" "$master_cf_tmp"
+                mv -f "$master_cf_tmp" "$master_cf"
+            else
+                rm -f "$master_cf_tmp"
+                __error "Could not set TLS overrides for the amavis Postfix transport"
+            fi
+        fi
+        postfix reload
+    fi
+
     # 4. The package ships disabled, so on a real reboot amavisd never comes up
     #    and Postfix's content_filter points at a dead port.
     systemctl enable "$AMAVIS_SERVICE" 2>/dev/null || true
@@ -2187,7 +2340,7 @@ __verify_services() {
     # The panel must answer through nginx, not just be listening. 000 means the
     # connection was refused; 5xx means the proxy chain is broken.
     local code
-    code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 \
+    code=$(curl -q -sk -o /dev/null -w '%{http_code}' --max-time 20 \
         "https://${APACHE_BACKEND_IP}:${ADMIN_PORT}/" 2>/dev/null) || true
     code="${code:-000}"
     case "$code" in
@@ -2335,7 +2488,10 @@ NOSITE_VHOST_EOF
     esac
 
     apachectl configtest
-    systemctl reload "${APACHE_SERVICE}"
+    # Apache may not be running yet; __final_configuration starts it either way.
+    if systemctl is-active --quiet "${APACHE_SERVICE}"; then
+        systemctl reload "${APACHE_SERVICE}"
+    fi
     __log "No-site catch-all page installed (${nosite_conf})"
 }
 
