@@ -1,6 +1,6 @@
 # Universal ISPConfig Installation Script
 
-A comprehensive, distro-agnostic installation script for ISPConfig hosting control panel. Installs a full LEMP/LAMP stack with Nginx as the SSL-terminating reverse proxy in front of Apache, multiple co-installable PHP versions, and a complete mail stack — fully automated with zero interactive prompts.
+A comprehensive, distro-agnostic installation script for ISPConfig hosting control panel. Installs a full LAMP stack with Apache serving sites and terminating TLS directly, multiple co-installable PHP versions, and a complete mail stack — fully automated with zero interactive prompts.
 
 ---
 
@@ -32,6 +32,9 @@ Set any of these variables before running the installer to choose credentials. I
 | `ISPCONFIG_ADMIN_USER` | `admin` | ISPConfig panel username |
 | `ISPCONFIG_DB_PASSWORD` | Generated | Password for the ISPConfig database user |
 | `ISPCONFIG_PHPINFO` | Disabled | Set to `1` to create the public `phpinfo.php` diagnostic page; see [Test PHP versions](#test-php-versions) |
+| `ISPCONFIG_PANEL_HOSTNAME` | `panel.casjay.app` | Hostname used for the ISPConfig panel vhost |
+| `ISPCONFIG_PANEL_CERT` | Generated self-signed certificate | Absolute certificate file path; set together with `ISPCONFIG_PANEL_KEY` |
+| `ISPCONFIG_PANEL_KEY` | Generated private key | Absolute private key path; set together with `ISPCONFIG_PANEL_CERT` |
 
 For example, run with explicit credentials from a root shell:
 
@@ -51,11 +54,11 @@ Passwords may not contain quotes, backslashes, backticks, dollar signs or whites
 
 - **🌍 Universal compatibility** — works across all major Linux distributions
 - **🐘 Multiple PHP versions** — installs PHP 7.4 through 8.5, whichever of those the distro's repositories actually offer — see [PHP version coverage](#-php-version-coverage)
-- **🔀 Nginx + Apache architecture** — Nginx handles SSL termination and static assets; Apache runs PHP on a loopback backend port
+- **🌐 Apache direct hosting** — Apache serves website vhosts and terminates TLS on ports 80 and 443; the panel is available on a configurable HTTPS hostname
 - **🔧 Fully automated** — no interactive prompts; generates passwords by default and supports environment overrides
-- **🛡️ Security first** — TLS 1.2/1.3 only, HSTS, DH params, Apache bound to loopback, credentials written mode `0600`. **No firewall is configured** — see [Security Notes](#-security-notes)
+- **🛡️ Security first** — HTTPS panel hostname, Apache default-host 404 page, internal ISPConfig panel listener, credentials written mode `0600`. **No firewall is configured** — see [Security Notes](#-security-notes)
 - **📧 Production mail stack** — Postfix + Dovecot + OpenDKIM with submission and SMTPS ports
-- **⚡ Production ready** — Event MPM, RemoteIP passthrough, PHP-FPM pools, logrotate
+- **⚡ Production ready** — Event MPM, PHP-FPM pools, logrotate
 
 ---
 
@@ -80,16 +83,16 @@ Passwords may not contain quotes, backslashes, backticks, dollar signs or whites
 
 ## 🏗️ Architecture
 
-```
+```text
 Internet
    │
    ▼
-Nginx :80        → redirect to HTTPS
-Nginx :443       → TLS termination → Apache 127.0.0.1:81  (websites)
-Nginx :64245     → TLS termination → Apache 127.0.0.1:7080 (ISPConfig panel)
+Apache :80        → hosted HTTP vhosts, ACME challenges, default HTTPS redirect
+Apache :443       → hosted HTTPS vhosts, default 404, ISPConfig panel hostname
+Apache 127.0.0.1:7080 → ISPConfig panel backend
 ```
 
-Apache listens only on loopback. All TLS, HSTS, and caching are handled by Nginx. PHP runs via FPM pools. ISPConfig manages Apache vhost templates and DNS; Nginx picks up Let's Encrypt certificates automatically via a deploy hook.
+Apache serves ISPConfig-managed sites directly, including `.htaccess` rules and PHP handlers. The panel is exposed through `ISPCONFIG_PANEL_HOSTNAME` (default `panel.casjay.app`) over HTTPS. The installer creates a self-signed certificate unless certificate and key paths are supplied through `ISPCONFIG_PANEL_CERT` and `ISPCONFIG_PANEL_KEY`. Certbot renewals reload Apache through a deploy hook.
 
 ---
 
@@ -97,8 +100,7 @@ Apache listens only on loopback. All TLS, HSTS, and caching are handled by Nginx
 
 | Component | Software |
 |---|---|
-| Frontend proxy | Nginx (Event, SSL, gzip, open-file-cache) |
-| Web backend | Apache (Event MPM, mod-fcgid, RemoteIP) |
+| Web server | Apache (Event MPM, mod_ssl, mod_fcgid) |
 | Database | MariaDB (secured, root password in `/root/.my.cnf`) |
 | PHP | Whatever the distro repos provide, up to 8.5, with FPM — see [PHP version coverage](#-php-version-coverage) |
 | Mail | Postfix + Dovecot + OpenDKIM (ports 25, 465, 587, 143, 993, 110, 995) |
@@ -108,7 +110,7 @@ Apache listens only on loopback. All TLS, HSTS, and caching are handled by Nginx
 | Anti-spam | SpamAssassin + Amavisd-new |
 | Antivirus | ClamAV |
 | Stats | Awstats, Webalizer |
-| SSL | Self-signed certs at install; Let's Encrypt via certbot + auto-sync hook |
+| SSL | Self-signed panel/default certs at install; Apache reload hook for Certbot renewals |
 
 PHP extensions installed per version: `mysql`, `pgsql`, `sqlite3`, `gd`, `imagick`, `mbstring`, `xml`, `curl`, `zip`, `soap`, `intl`, `bcmath`, `opcache`, `readline`, `bz2`, `xsl`, `tidy`, `ldap`, `imap`, `gettext`, `exif`, `sockets`, `redis`, `memcached`.
 
@@ -119,10 +121,12 @@ PHP extensions installed per version: `mysql`, `pgsql`, `sqlite3`, `gd`, `imagic
 ### Access the panel
 
 ```
-https://<server-ip>:64245
-Username: admin
+https://<ISPCONFIG_PANEL_HOSTNAME>/
+Username: admin (unless overridden)
 Password: see /root/ispconfig_installation_summary.txt
 ```
+
+The default panel hostname is `panel.casjay.app`. Set `ISPCONFIG_PANEL_HOSTNAME` to choose a different name, and point its DNS record at the server. Certificate and key overrides must be supplied together.
 
 ### Summary file
 
@@ -134,15 +138,7 @@ All generated credentials, architecture details, port mapping, and next steps ar
 
 ### Let's Encrypt workflow
 
-```bash
-# Issue a cert (ACME webroot is pre-configured at /var/www/letsencrypt)
-certbot certonly --webroot -w /var/www/letsencrypt -d example.com -d www.example.com
-
-# Sync cert to Nginx vhosts and reload Nginx (runs automatically on renewal)
-/usr/local/bin/ispconfig-nginx-sync
-```
-
-The sync helper processes certificate directories containing both `fullchain.pem` and `privkey.pem`, then tests and reloads Nginx even when the generated vhost configuration text has not changed. OCSP stapling is enabled for a vhost only when its certificate provides an OCSP responder URI and a local CA bundle is available.
+The installer serves ACME challenges from `/var/www/letsencrypt` and installs an Apache reload hook at `/etc/letsencrypt/renewal-hooks/deploy/99-ispconfig-apache-reload`. Issue certificates with Certbot, then configure their paths for the panel or hosted site in ISPConfig/Apache.
 
 ### Test PHP versions
 
@@ -154,7 +150,7 @@ To generate it for testing, set `ISPCONFIG_PHPINFO=1` before running the install
 sudo env ISPCONFIG_PHPINFO=1 bash install.sh
 ```
 
-Visit `https://<server-ip>/phpinfo.php` (self-signed certificate) to list all installed PHP versions and confirm `X-Forwarded-Proto` passthrough. The page is served by the catch-all no-site vhost; the 404 rule lets only `phpinfo.php` through. **Remove it before going live** (`rm -f /var/www/ispconfig-nosite/phpinfo.php`).
+Visit `https://<server-ip>/phpinfo.php` (self-signed certificate) to list all installed PHP versions and confirm the PHP handler is working. The page is served by the catch-all no-site vhost; the 404 rule lets only `phpinfo.php` through. **Remove it before going live** (`rm -f /var/www/ispconfig-nosite/phpinfo.php`).
 
 ---
 
@@ -179,43 +175,29 @@ PHP 5.6 and 7.0–7.3 are **not supported** and are never requested. The install
 | `/usr/local/ispconfig/` | ISPConfig root |
 | `/root/ispconfig_installation_summary.txt` | Credentials and next steps |
 | `/root/.my.cnf` | MariaDB root credentials |
-| `/etc/nginx/nginx.conf` | Nginx main config |
-| `/etc/nginx/vhosts.d/` | Nginx virtual host drop-ins |
+| `/etc/apache2/` or `/etc/httpd/` | Apache configuration (path varies by distribution) |
 | `/etc/postfix/main.cf` | Postfix config |
 | `/etc/dovecot/conf.d/` | Dovecot config |
 | `/etc/opendkim.conf` | OpenDKIM config |
-| `/usr/local/bin/ispconfig-nginx-sync` | Cert sync helper |
+| `/etc/letsencrypt/renewal-hooks/deploy/99-ispconfig-apache-reload` | Reloads Apache after certificate renewal |
 
 ### Ports to open
 
-The installer configures **no firewall** — this is what you need to allow inbound if you set one up:
+The installer configures **no firewall** — allow inbound ports below if you set one up:
 
 | Port | Service | Exposure |
 |---|---|---|
-| 80 | Nginx HTTP | Public |
-| 443 | Nginx HTTPS | Public |
-| 64245 | ISPConfig panel | Public (restrict to your IP if possible) |
+| 80 | Apache HTTP | Public |
+| 443 | Apache HTTPS, including the ISPConfig panel hostname | Public |
 | 21 | ProFTPd | Public if FTP is used |
 | 22 | SSH | Public — **keep this open or you will lock yourself out** |
 | 25, 465, 587 | Postfix SMTP / SMTPS / submission | Public if mail is used |
 | 110, 143, 993, 995 | Dovecot POP3 / IMAP / IMAPS / POP3S | Public if mail is used |
-| 81, 7080, 7081 | Apache backend | Loopback only — never open |
+| 7080, 7081 | ISPConfig internal Apache listeners | Loopback only — never open |
 
-### Add a custom Nginx vhost
+### Add a custom Apache vhost
 
-```bash
-# Drop a .conf file and reload — no ISPConfig involvement needed
-cat > /etc/nginx/vhosts.d/myapp.conf << 'EOF'
-server {
-    listen 443 ssl;
-    server_name myapp.example.com;
-    ssl_certificate     /etc/letsencrypt/live/myapp.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/myapp.example.com/privkey.pem;
-    location / { proxy_pass http://127.0.0.1:3000; }
-}
-EOF
-nginx -t && systemctl reload nginx
-```
+ISPConfig manages hosted-site vhosts. For a standalone application, add an Apache virtual host under the distribution's Apache configuration directory, then validate and reload the service (`apachectl configtest` and `systemctl reload httpd` on RHEL-family systems, or `apache2` on Debian/Ubuntu).
 
 ---
 
@@ -243,9 +225,9 @@ Also set a **PTR record** (reverse DNS) for your server IP → `<hostname>` with
 ## 🔧 Service Management
 
 ```bash
-# Nginx
-systemctl reload nginx          # reload config without dropping connections
-systemctl restart nginx
+# Apache
+systemctl reload apache          # reload config without dropping connections
+systemctl restart apache
 
 # Apache (Debian/Ubuntu)
 systemctl restart apache2
@@ -275,8 +257,8 @@ systemctl restart mariadb
 
 **Cannot reach the ISPConfig panel**
 ```bash
-systemctl status nginx apache2    # check both are running
-ss -lntp | grep -E ':(443|64245)\b'   # confirm they are listening
+systemctl status apache2 httpd    # service name varies by distribution
+ss -lntp | grep -E ':(443|7080)\b'   # confirm they are listening
 # If you have enabled a firewall yourself, check what it allows:
 ufw status                        # Debian/Ubuntu
 firewall-cmd --list-ports         # RHEL-family
@@ -297,9 +279,9 @@ tail -f /var/log/mail.log
 postconf smtpd_milters              # verify OpenDKIM is wired in
 ```
 
-**Nginx config test**
+**Apache config test**
 ```bash
-nginx -t
+apachectl configtest
 ```
 
 **A step reports `[FAILED]`**

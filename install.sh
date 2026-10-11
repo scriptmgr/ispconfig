@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202610111924-git
+##@Version           :  202610111745-git
 # @@Author           :  ISPConfig Universal Installer Contributors
 # @@Contact          :  https://github.com/scriptmgr/ispconfig
 # @@License          :  MIT
@@ -9,7 +9,7 @@
 # @@Copyright        :  Copyright: (c) 2025 ISPConfig Universal Installer Contributors
 # @@Created          :  Monday, August 24, 2026 15:34 EDT
 # @@File             :  install.sh
-# @@Description      :  Universal distro-agnostic ISPConfig installer with Nginx reverse proxy, multi-PHP, and full mail stack
+# @@Description      :  Universal distro-agnostic ISPConfig installer with Apache direct hosting, multi-PHP, and full mail stack
 # @@Changelog        :  See git log for full history; latest: 404 catch-all page for unconfigured hosts, env credential overrides, DNS enable on boot
 # @@TODO             :  none
 # @@Other            :  none
@@ -20,10 +20,10 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202610111924-git"
+VERSION="202610111745-git"
 
 # Universal ISPConfig Installation Script
-# Architecture: Nginx (frontend, SSL termination) → Apache (backend, 127.0.0.1:81)
+# Architecture: Apache direct listeners on :80/:443; ISPConfig panel on configured hostname
 # Run as root: bash install.sh
 
 set -e
@@ -51,7 +51,7 @@ export APT_LISTCHANGES_FRONTEND=none
 STATE_FILE=""
 NOSITE_PHPINFO=0
 
-ADMIN_PORT=64245
+ADMIN_PORT=443
 ISPCONFIG_MYSQL_ROOT_PASSWORD="${ISPCONFIG_MYSQL_ROOT_PASSWORD:-}"
 ISPCONFIG_ADMIN_PASSWORD="${ISPCONFIG_ADMIN_PASSWORD:-}"
 ISPCONFIG_ADMIN_USER="${ISPCONFIG_ADMIN_USER:-}"
@@ -65,17 +65,18 @@ SERVICE_MANAGER="systemctl"
 PHP_DEFAULT="8.3"
 PHP_VERSIONS=("8.5" "8.4" "8.3" "8.2" "8.1" "8.0" "7.4")
 
-# Reverse proxy settings
+# Apache direct-listener settings
 APACHE_BACKEND_IP="127.0.0.1"
-APACHE_BACKEND_PORT="81"
 APACHE_ADMIN_PORT="7080"
 APACHE_APPS_PORT="7081"
-NGINX_VHOSTS_DIR="/etc/nginx/vhosts.d"
+PANEL_HOSTNAME="${ISPCONFIG_PANEL_HOSTNAME:-panel.casjay.app}"
 LETSENCRYPT_WEBROOT="/var/www/letsencrypt"
 SSL_DIR="/etc/ssl/ispconfig"
+PANEL_CERT_FILE="${ISPCONFIG_PANEL_CERT:-/etc/ssl/ispconfig/ispconfig.crt}"
+PANEL_KEY_FILE="${ISPCONFIG_PANEL_KEY:-/etc/ssl/ispconfig/ispconfig.key}"
 
 # Set by __validate_distro
-NGINX_USER=""
+APACHE_USER=""
 SSL_CA_BUNDLE=""
 APACHE_SERVICE=""
 APACHE_CONF_DIR=""
@@ -212,7 +213,7 @@ __validate_distro() {
     case "$DISTRO" in
         "ubuntu")
             [[ "$DISTRO_VERSION" =~ ^(18|20|22|24|25|26) ]] && supported=true && PACKAGE_MANAGER="apt"
-            NGINX_USER="www-data"
+            APACHE_USER="www-data"
             SSL_CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
             APACHE_SERVICE="apache2"
             APACHE_CONF_DIR="/etc/apache2"
@@ -221,7 +222,7 @@ __validate_distro() {
             ;;
         "debian")
             [[ "$DISTRO_VERSION" =~ ^(9|10|11|12|13) ]] && supported=true && PACKAGE_MANAGER="apt"
-            NGINX_USER="www-data"
+            APACHE_USER="www-data"
             SSL_CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
             APACHE_SERVICE="apache2"
             APACHE_CONF_DIR="/etc/apache2"
@@ -234,7 +235,7 @@ __validate_distro() {
                 PACKAGE_MANAGER="yum"
                 [[ "$DISTRO_VERSION" =~ ^(8|9) ]] && PACKAGE_MANAGER="dnf"
             fi
-            NGINX_USER="nginx"
+            APACHE_USER="apache"
             SSL_CA_BUNDLE="/etc/pki/tls/certs/ca-bundle.crt"
             APACHE_SERVICE="httpd"
             APACHE_CONF_DIR="/etc/httpd"
@@ -243,7 +244,7 @@ __validate_distro() {
             ;;
         "almalinux"|"rocky")
             [[ "$DISTRO_VERSION" =~ ^(8|9|10) ]] && supported=true && PACKAGE_MANAGER="dnf"
-            NGINX_USER="nginx"
+            APACHE_USER="apache"
             SSL_CA_BUNDLE="/etc/pki/tls/certs/ca-bundle.crt"
             APACHE_SERVICE="httpd"
             APACHE_CONF_DIR="/etc/httpd"
@@ -252,7 +253,7 @@ __validate_distro() {
             ;;
         "fedora")
             [[ "$DISTRO_VERSION" =~ ^(3[6-9]|4[0-9]) ]] && supported=true && PACKAGE_MANAGER="dnf"
-            NGINX_USER="nginx"
+            APACHE_USER="apache"
             SSL_CA_BUNDLE="/etc/pki/tls/certs/ca-bundle.crt"
             APACHE_SERVICE="httpd"
             APACHE_CONF_DIR="/etc/httpd"
@@ -261,7 +262,7 @@ __validate_distro() {
             ;;
         "opensuse"|"opensuse-leap"|"sles")
             [[ "$DISTRO_VERSION" =~ ^(15|42) ]] && supported=true && PACKAGE_MANAGER="zypper"
-            NGINX_USER="nginx"
+            APACHE_USER="apache"
             SSL_CA_BUNDLE="/etc/ssl/ca-bundle.pem"
             APACHE_SERVICE="apache2"
             APACHE_CONF_DIR="/etc/apache2"
@@ -294,6 +295,17 @@ __generate_passwords() {
     __validate_credential ISPCONFIG_DB_PASSWORD "$ISPCONFIG_DB_PASSWORD"
     if [[ -n "$ISPCONFIG_ADMIN_USER" && ! "$ISPCONFIG_ADMIN_USER" =~ ^[A-Za-z0-9._-]+$ ]]; then
         __error "ISPCONFIG_ADMIN_USER may contain only letters, digits, dot, underscore and hyphen"
+    fi
+    if [[ ! "$PANEL_HOSTNAME" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ \
+        || ${#PANEL_HOSTNAME} -gt 253 ]]; then
+        __error "ISPCONFIG_PANEL_HOSTNAME must be a valid fully-qualified DNS hostname"
+    fi
+    if [[ -n "${ISPCONFIG_PANEL_CERT:-}" && -z "${ISPCONFIG_PANEL_KEY:-}" \
+        || -z "${ISPCONFIG_PANEL_CERT:-}" && -n "${ISPCONFIG_PANEL_KEY:-}" ]]; then
+        __error "ISPCONFIG_PANEL_CERT and ISPCONFIG_PANEL_KEY must be set together"
+    fi
+    if [[ ! "$PANEL_CERT_FILE" =~ ^/[A-Za-z0-9._/-]+$ || ! "$PANEL_KEY_FILE" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+        __error "ISPCONFIG_PANEL_CERT and ISPCONFIG_PANEL_KEY must be absolute paths without whitespace"
     fi
     if [[ -z "$ISPCONFIG_MYSQL_ROOT_PASSWORD" ]]; then
         ISPCONFIG_MYSQL_ROOT_PASSWORD=$(openssl rand -base64 32)
@@ -389,257 +401,17 @@ __install_base_packages() {
     esac
 }
 
-# ── Nginx install + config ────────────────────────────────────────────────────
-# nginx 1.25.1 deprecated "listen ... http2" in favour of a separate
-# "http2 on;" directive, which older releases do not know. Pick the form the
-# installed nginx understands so neither a warning nor a config error appears.
-NGINX_H2_LISTEN=" http2"
-NGINX_H2_DIRECTIVE=""
-__nginx_http2_form() {
-    local ver
-    ver=$(nginx -v 2>&1 | sed -n 's|.*nginx/\([0-9][0-9.]*\).*|\1|p')
-    if [[ -n "$ver" && "$(printf '%s\n1.25.1\n' "$ver" | sort -V | head -n1)" == "1.25.1" ]]; then
-        NGINX_H2_LISTEN=""
-        NGINX_H2_DIRECTIVE="    http2       on;"
+# ── Existing Nginx shutdown ───────────────────────────────────────────────────
+__disable_nginx() {
+    if ! command -v nginx >/dev/null 2>&1 && ! systemctl list-unit-files nginx.service --no-legend 2>/dev/null | grep -q -- '^nginx\.service'; then
+        __log "Nginx is not installed"
+        return 0
     fi
-}
 
-__install_nginx() {
-    __log "Installing Nginx..."
-
-    # The configuration below replaces /etc/nginx wholesale. If nginx was
-    # already configured on this host, keep a copy so nothing is lost.
-    local nginx_backup=""
-    if [[ -f /etc/nginx/nginx.conf ]]; then
-        nginx_backup="/etc/nginx.pre-ispconfig.$(date +%Y%m%d%H%M%S)"
-        cp -a /etc/nginx "$nginx_backup"
-        __warn "Existing /etc/nginx backed up to ${nginx_backup} before being replaced"
-    fi
-    case "$PACKAGE_MANAGER" in
-        "apt")
-            apt-get install -y nginx
-            ;;
-        "dnf"|"yum")
-            $PACKAGE_MANAGER install -y nginx
-            ;;
-        "zypper")
-            zypper install -y nginx
-            ;;
-    esac
-
-    # Stop nginx immediately — it will be started last in __final_configuration
-    # once Apache is already running on the backend port.
     systemctl stop nginx 2>/dev/null || true
-
-    __log "Building Nginx configuration..."
-
-    # Wipe everything except mime.types
-    find /etc/nginx -mindepth 1 -maxdepth 1 ! -name 'mime.types' -exec rm -rf {} \;
-
-    mkdir -p "$NGINX_VHOSTS_DIR"
-    mkdir -p "$LETSENCRYPT_WEBROOT/.well-known/acme-challenge"
-    chown -R "$NGINX_USER:$NGINX_USER" "$LETSENCRYPT_WEBROOT" 2>/dev/null || true
-
-    # The file-descriptor limit comes from systemd, not worker_rlimit_nofile:
-    # SELinux denies nginx workers setrlimit(), which logs an alert per worker.
-    mkdir -p /etc/systemd/system/nginx.service.d
-    printf '[Service]\nLimitNOFILE=131072\n' > /etc/systemd/system/nginx.service.d/limits.conf
-    systemctl daemon-reload
-
-    # ── nginx.conf ────────────────────────────────────────────────────────────
-    cat > /etc/nginx/nginx.conf << 'NGINX_EOF'
-user NGINX_USER_PLACEHOLDER;
-worker_processes auto;
-worker_cpu_affinity auto;
-pid /run/nginx.pid;
-
-events {
-    worker_connections  65535;
-    use                 epoll;
-    multi_accept        on;
-}
-
-http {
-    charset             utf-8;
-    include             mime.types;
-    default_type        application/octet-stream;
-    server_tokens       off;
-
-    # ── Logging ───────────────────────────────────────────────────────────────
-    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
-                      '$status $body_bytes_sent "$http_referer" '
-                      '"$http_user_agent" "$http_x_forwarded_for"';
-    access_log  /var/log/nginx/access.log  main buffer=32k flush=5m;
-    error_log   /var/log/nginx/error.log   warn;
-
-    # ── Performance ───────────────────────────────────────────────────────────
-    sendfile            on;
-    tcp_nopush          on;
-    tcp_nodelay         on;
-    keepalive_timeout   65;
-    keepalive_requests  10000;
-    reset_timedout_connection on;
-    client_body_timeout 30;
-    client_header_timeout 30;
-    send_timeout        30;
-
-    # ── Buffers ───────────────────────────────────────────────────────────────
-    client_body_buffer_size     128k;
-    client_max_body_size        100m;
-    client_header_buffer_size   1k;
-    large_client_header_buffers 4 16k;
-    output_buffers              2 32k;
-    postpone_output             1460;
-
-    # ── File cache ────────────────────────────────────────────────────────────
-    open_file_cache          max=200000 inactive=20s;
-    open_file_cache_valid    30s;
-    open_file_cache_min_uses 2;
-    open_file_cache_errors   on;
-
-    # ── Gzip ──────────────────────────────────────────────────────────────────
-    gzip              on;
-    gzip_vary         on;
-    gzip_proxied      any;
-    gzip_comp_level   6;
-    gzip_buffers      16 8k;
-    gzip_http_version 1.1;
-    gzip_min_length   256;
-    gzip_types
-        application/atom+xml application/geo+json application/javascript
-        application/x-javascript application/json application/ld+json
-        application/manifest+json application/rdf+xml application/rss+xml
-        application/xhtml+xml application/xml font/eot font/otf font/ttf
-        image/svg+xml text/css text/javascript text/plain text/xml;
-
-    # ── Proxy defaults (inherited by all proxy_pass locations) ────────────────
-    proxy_http_version          1.1;
-    proxy_set_header Host       $http_host;
-    proxy_set_header X-Real-IP  $remote_addr;
-    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Forwarded-Host  $http_host;
-    proxy_set_header X-Forwarded-Port  $server_port;
-    proxy_set_header Connection "";
-    # A backend Apache with mod_http2 advertises "Upgrade: h2". Forwarding that
-    # to an HTTP/2 client is a protocol violation (stream PROTOCOL_ERROR).
-    proxy_hide_header Upgrade;
-    proxy_redirect              off;
-    proxy_connect_timeout       60s;
-    proxy_send_timeout          60s;
-    proxy_read_timeout          60s;
-    proxy_buffer_size           16k;
-    proxy_buffers               4 64k;
-    proxy_busy_buffers_size     128k;
-    proxy_temp_file_write_size  128k;
-    proxy_cache_bypass          $http_upgrade;
-    proxy_intercept_errors      off;
-
-    # ── SSL global ────────────────────────────────────────────────────────────
-    ssl_protocols               TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers   on;
-    ssl_ciphers                 ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256;
-    ssl_dhparam                 /etc/nginx/dhparam.pem;
-    ssl_ecdh_curve              secp384r1;
-    ssl_session_cache           shared:SSL:50m;
-    ssl_session_timeout         1d;
-    ssl_session_tickets         off;
-    # OCSP stapling is deliberately NOT set globally: the installer ships
-    # self-signed certs, and stapling against a self-signed leaf makes nginx
-    # log "issuer certificate not found" on every start while doing nothing.
-    # The Let's Encrypt vhost generator enables it per-vhost, where the chain
-    # actually reaches a real CA.
-    ssl_trusted_certificate     SSL_CA_BUNDLE_PLACEHOLDER;
-    resolver                    1.1.1.1 8.8.8.8 valid=300s;
-    resolver_timeout            5s;
-
-    # ── Apache backend upstream ───────────────────────────────────────────────
-    upstream apache_backend {
-        server      APACHE_BACKEND_IP_PLACEHOLDER:APACHE_BACKEND_PORT_PLACEHOLDER;
-        keepalive   64;
-    }
-
-    # ── ISPConfig admin upstream ──────────────────────────────────────────────
-    upstream ispconfig_admin {
-        server      APACHE_BACKEND_IP_PLACEHOLDER:APACHE_ADMIN_PORT_PLACEHOLDER;
-        keepalive   8;
-    }
-
-    include NGINX_VHOSTS_DIR_PLACEHOLDER/*.conf;
-}
-NGINX_EOF
-
-    sed -i \
-        -e "s|NGINX_USER_PLACEHOLDER|${NGINX_USER}|g" \
-        -e "s|SSL_CA_BUNDLE_PLACEHOLDER|${SSL_CA_BUNDLE}|g" \
-        -e "s|APACHE_BACKEND_IP_PLACEHOLDER|${APACHE_BACKEND_IP}|g" \
-        -e "s|APACHE_BACKEND_PORT_PLACEHOLDER|${APACHE_BACKEND_PORT}|g" \
-        -e "s|APACHE_ADMIN_PORT_PLACEHOLDER|${APACHE_ADMIN_PORT}|g" \
-        -e "s|NGINX_VHOSTS_DIR_PLACEHOLDER|${NGINX_VHOSTS_DIR}|g" \
-        /etc/nginx/nginx.conf
-
-    __nginx_http2_form
-
-    # ── vhosts.d/00-redirect-http.conf ───────────────────────────────────────
-    cat > "${NGINX_VHOSTS_DIR}/00-redirect-http.conf" << VHOST_EOF
-server {
-    listen      80 default_server;
-    listen      [::]:80 default_server;
-    server_name _;
-
-    # ACME challenge for Let's Encrypt (served before redirect)
-    location ^~ /.well-known/acme-challenge/ {
-        root  ${LETSENCRYPT_WEBROOT};
-        default_type text/plain;
-        try_files \$uri =404;
-    }
-
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-}
-VHOST_EOF
-
-    # ── vhosts.d/00-default-https.conf ───────────────────────────────────────
-    cat > "${NGINX_VHOSTS_DIR}/00-default-https.conf" << VHOST_EOF
-server {
-    listen      443 ssl${NGINX_H2_LISTEN} default_server;
-    listen      [::]:443 ssl${NGINX_H2_LISTEN} default_server;
-${NGINX_H2_DIRECTIVE}
-    server_name _;
-
-    ssl_certificate     ${SSL_DIR}/default.crt;
-    ssl_certificate_key ${SSL_DIR}/default.key;
-
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-    add_header X-Content-Type-Options    nosniff always;
-    add_header X-Frame-Options           SAMEORIGIN always;
-    add_header X-XSS-Protection          "1; mode=block" always;
-    add_header Referrer-Policy           "strict-origin-when-cross-origin" always;
-
-    # ACME challenge
-    location ^~ /.well-known/acme-challenge/ {
-        root  ${LETSENCRYPT_WEBROOT};
-        default_type text/plain;
-        try_files \$uri =404;
-    }
-
-    # Static asset caching (served via Apache but cached at edge)
-    location ~* \.(jpg|jpeg|gif|png|ico|svg|webp|css|js|woff|woff2|ttf|eot)\$ {
-        proxy_pass         http://apache_backend;
-        expires            30d;
-        add_header         Cache-Control "public, no-transform";
-        proxy_cache_bypass 0;
-    }
-
-    location / {
-        proxy_pass http://apache_backend;
-    }
-}
-VHOST_EOF
-
-    __log "Nginx installed and configured (vhosts.d panel vhost added post-ISPConfig)"
-    systemctl enable nginx
+    systemctl disable nginx 2>/dev/null || true
+    systemctl mask nginx 2>/dev/null || true
+    __log "Nginx stopped, disabled, and masked"
 }
 
 # ── Apache install ────────────────────────────────────────────────────────────
@@ -653,7 +425,7 @@ __install_apache() {
             systemctl start apache2
             ;;
         "dnf"|"yum")
-            $PACKAGE_MANAGER install -y httpd mod_fcgid
+            $PACKAGE_MANAGER install -y httpd mod_ssl mod_fcgid
             systemctl enable httpd
             systemctl start httpd
             ;;
@@ -1323,7 +1095,7 @@ __install_fail2ban() {
     # directly — no log files need to exist at startup. This works across
     # all supported distros (all use systemd) including those that do not
     # install rsyslog (Debian 12+, Ubuntu 22.04+, RHEL 9+).
-    # ignoreip includes loopback so nginx→apache backend traffic is never banned.
+    # ignoreip includes loopback so local panel proxy traffic is never banned.
     cat > /etc/fail2ban/jail.d/ispconfig.conf << EOF
 [DEFAULT]
 ignoreip = 127.0.0.1/8 ::1
@@ -1392,7 +1164,7 @@ __install_ispconfig() {
     __log "Running ISPConfig autoinstall..."
 
     # ISPConfig uses INI-format autoinstall files (see docs/autoinstall_samples/)
-    # ispconfig_port here is the *internal* Apache port (nginx proxies ADMIN_PORT → this)
+    # ispconfig_port is the loopback-only ISPConfig panel backend port
     cat > /tmp/ispconfig_autoinstall.ini << EOF
 [install]
 language=en
@@ -1488,362 +1260,170 @@ EOF
     __log "Granted the ispconfig DB user access from localhost and 127.0.0.1"
 }
 
-# ── Apache backend hardening (runs after ISPConfig install) ──────────────────
+# ── Apache direct-listener configuration ─────────────────────────────────────
 __configure_apache_backend() {
-    __log "Reconfiguring Apache as reverse-proxy backend..."
+    __log "Configuring Apache for direct HTTP and HTTPS traffic..."
 
-    case "$DISTRO" in
-        "ubuntu"|"debian")
-            # Switch to Event MPM
-            a2dismod mpm_prefork mpm_worker 2>/dev/null || true
-            a2enmod  mpm_event remoteip
-
-            # ISPConfig's apps.vhost uses SuexecUserGroup under mod_fcgid — the
-            # module ships disabled by default (matches casjay-base/debian and
-            # /ubuntu mods-available/suexec.load); without enabling it, Apache
-            # fails to start entirely (502 from nginx in front).
+    local listen_file="${APACHE_CONF_DIR}/conf/httpd.conf"
+    local config_dirs=("${APACHE_CONF_DIR}" "${APACHE_VHOST_DIR}")
+    case "$PACKAGE_MANAGER" in
+        apt)
+            listen_file="${APACHE_CONF_DIR}/ports.conf"
+            a2dismod mpm_prefork mpm_worker remoteip 2>/dev/null || true
+            a2enmod mpm_event ssl rewrite headers proxy proxy_http
             a2enmod suexec 2>/dev/null || true
-
-            # Tune Event MPM
-            cat > /etc/apache2/mods-available/mpm_event.conf << 'MPMEOF'
-<IfModule mpm_event_module>
-    StartServers              4
-    MinSpareThreads          25
-    MaxSpareThreads          75
-    ThreadLimit              64
-    ThreadsPerChild          25
-    MaxRequestWorkers       400
-    MaxConnectionsPerChild 10000
-</IfModule>
-MPMEOF
-
-            # Bind to loopback only on backend ports
-            cat > /etc/apache2/ports.conf << PORTSEOF
-Listen ${APACHE_BACKEND_IP}:${APACHE_BACKEND_PORT}
-Listen ${APACHE_BACKEND_IP}:${APACHE_ADMIN_PORT}
-Listen ${APACHE_BACKEND_IP}:${APACHE_APPS_PORT}
-PORTSEOF
-
-            # RemoteIP — trust nginx at 127.0.0.1
-            cat > /etc/apache2/conf-available/remoteip.conf << 'RIPEOF'
-RemoteIPHeader X-Forwarded-For
-RemoteIPInternalProxy 127.0.0.1
-RemoteIPInternalProxy ::1
-RIPEOF
-            a2enconf remoteip
-
-            # HTTPS env passthrough from nginx X-Forwarded-Proto header
-            cat > /etc/apache2/conf-available/forwarded-https.conf << 'FWDEOF'
-SetEnvIf X-Forwarded-Proto https HTTPS=on
-SetEnvIf X-Forwarded-Proto https REQUEST_SCHEME=https
-FWDEOF
-            a2enconf forwarded-https
-
-            # Patch all Apache vhosts (ISPConfig uses both .conf and .vhost extensions)
-            for dir in /etc/apache2/sites-available /etc/apache2/sites-enabled; do
-                for f in "${dir}"/*.conf "${dir}"/*.vhost; do
-                    [[ -f "$f" ]] || continue
-                    sed -i \
-                        -e "s|<VirtualHost \*:80>|<VirtualHost ${APACHE_BACKEND_IP}:${APACHE_BACKEND_PORT}>|g" \
-                        -e "s|<VirtualHost \*:443>|<VirtualHost ${APACHE_BACKEND_IP}:${APACHE_BACKEND_PORT}>|g" \
-                        -e "s|<VirtualHost \*:${ADMIN_PORT}>|<VirtualHost ${APACHE_BACKEND_IP}:${APACHE_ADMIN_PORT}>|g" \
-                        -e "s|<VirtualHost _default_:\([0-9]*\)>|<VirtualHost ${APACHE_BACKEND_IP}:\1>|g" \
-                        -e '/^[[:space:]]*Listen [0-9]/d' \
-                        -e '/^[[:space:]]*NameVirtualHost/d' \
-                        -e '/SSLEngine [Oo]n/d' \
-                        -e '/SSLCertificateFile/d' \
-                        -e '/SSLCertificateKeyFile/d' \
-                        -e '/SSLCertificateChainFile/d' \
-                        -e '/SSLCACertificateFile/d' \
-                        -e '/SSLProtocol/d' \
-                        -e '/SSLCipherSuite/d' \
-                        -e '/SSLHonorCipherOrder/d' \
-                        "$f"
-                done
-            done
-            # Fix ISPConfig panel PHP-FCGI starters: point to actual installed PHP-CGI
-            # ISPConfig may generate starters referencing a PHP version that isn't installed
-            local php_cgi_bin
-            php_cgi_bin=$(update-alternatives --query php-cgi 2>/dev/null | awk '/^Value:/{print $2}')
-            [[ -z "$php_cgi_bin" ]] && php_cgi_bin=$(command -v "php-cgi${PHP_DEFAULT}" || command -v php-cgi 2>/dev/null)
-            if [[ -n "$php_cgi_bin" ]]; then
-                local php_ver_dir
-                php_ver_dir=$(readlink -f "$php_cgi_bin" 2>/dev/null) || php_ver_dir=""
-                php_ver_dir="${php_ver_dir%/*}"
-                php_ver_dir="${php_ver_dir%/bin}"
-                # Extract version from binary name (php-cgi does not support -r; use path parsing)
-                local php_ver
-                php_ver=$(printf '%s' "${php_cgi_bin##*/}" | grep -oE -- '[0-9]+\.[0-9]+' | head -1)
-                # Fallback: ask the CLI binary if path parsing yields nothing
-                [[ -z "$php_ver" ]] && php_ver=$(command -v "php${PHP_DEFAULT}" >/dev/null 2>&1 && \
-                    "php${PHP_DEFAULT}" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null) || true
-                for starter in /var/www/php-fcgi-scripts/ispconfig/.php-fcgi-starter \
-                               /var/www/php-fcgi-scripts/apps/.php-fcgi-starter; do
-                    [[ -f "$starter" ]] || continue
-                    # ISPConfig sets the immutable flag on this file; lift it temporarily,
-                    # write via tmp+cp (sed -i rename also fails on immutable files), restore.
-                    local _tmp
-                    _tmp=$(mktemp)
-                    chattr -i "$starter" 2>/dev/null || true
-                    sed \
-                        -e "s|PHPRC=.*|PHPRC=/etc/php/${php_ver}/cgi/|" \
-                        -e "s|exec /usr/bin/php-cgi|exec ${php_cgi_bin}|" \
-                        "$starter" > "$_tmp" && cp "$_tmp" "$starter"
-                    chattr +i "$starter" 2>/dev/null || true
-                    rm -f "$_tmp"
-                done
-            fi
-            systemctl restart apache2
+            config_dirs=("${APACHE_CONF_DIR}/sites-available" "${APACHE_CONF_DIR}/sites-enabled" "${APACHE_CONF_DIR}/conf-available")
             ;;
-
-        "opensuse"|"opensuse-leap"|"sles")
-            # openSUSE/SLES apache2 has no conf.modules.d and no sites-available/
-            # sites-enabled split — modules are toggled with a2enmod/a2dismod
-            # (like Debian) but the main config lives directly at
-            # ${APACHE_CONF_DIR}/httpd.conf (no "conf" subdirectory, unlike RHEL),
-            # and ISPConfig's SuSE installer writes vhosts flat into
-            # ${APACHE_VHOST_DIR} (/etc/apache2/vhosts.d), auto-included via a
-            # wildcard Include in httpd.conf. This branch was previously falling
-            # through to the RHEL `*)` case, which used RHEL-only paths and
-            # silently no-op'd on this distro.
-            a2dismod mpm_prefork mpm_worker 2>/dev/null || true
-            a2enmod  mpm_event remoteip
-
-            # ISPConfig's apps.vhost uses SuexecUserGroup under mod_fcgid. SUSE
-            # docs claim mod_suexec ships enabled by default, but that hasn't
-            # been verified against this script's target images — enable it
-            # idempotently via a2enmod so the fix holds either way.
+        zypper)
+            listen_file="${APACHE_CONF_DIR}/httpd.conf"
+            a2dismod mpm_prefork mpm_worker remoteip 2>/dev/null || true
+            a2enmod mpm_event ssl rewrite headers proxy proxy_http
             a2enmod suexec 2>/dev/null || true
-
-            # ISPConfig writes its panel port from autoinstall.ini (ispconfig_port)
-            # but the apps port is hardcoded by ISPConfig (panel_port is NOT +1).
-            # Discover actual ports from the generated vhost files so we listen on
-            # the right ports regardless of ISPConfig version defaults.
-            local suse_admin_port suse_apps_port
-            suse_admin_port=$(grep -h -- "^[[:space:]]*Listen[[:space:]]" \
-                "${APACHE_VHOST_DIR}/ispconfig.vhost" 2>/dev/null | \
-                awk '{print $2}' | head -1)
-            suse_apps_port=$(grep -h -- "^[[:space:]]*Listen[[:space:]]" \
-                "${APACHE_VHOST_DIR}/apps.vhost" 2>/dev/null | \
-                awk '{print $2}' | head -1)
-            [[ -n "$suse_admin_port" ]] && APACHE_ADMIN_PORT="$suse_admin_port"
-            [[ -n "$suse_apps_port"  ]] && APACHE_APPS_PORT="$suse_apps_port"
-            __log "ISPConfig panel port: ${APACHE_ADMIN_PORT}, apps port: ${APACHE_APPS_PORT}"
-            __save_var APACHE_ADMIN_PORT
-            __save_var APACHE_APPS_PORT
-
-            # Replace ALL Listen directives in httpd.conf with our loopback-only set.
-            sed -i '/^[[:space:]]*Listen /d' "${APACHE_CONF_DIR}/httpd.conf"
-            cat >> "${APACHE_CONF_DIR}/httpd.conf" << LISTENEOF
-
-# Backend ports — loopback only (nginx terminates TLS externally)
-Listen ${APACHE_BACKEND_IP}:${APACHE_BACKEND_PORT}
-Listen ${APACHE_BACKEND_IP}:${APACHE_ADMIN_PORT}
-Listen ${APACHE_BACKEND_IP}:${APACHE_APPS_PORT}
-LISTENEOF
-
-            # Event MPM tuning
-            cat >> "${APACHE_CONF_DIR}/httpd.conf" << 'MPMTUNEEOF'
-
-<IfModule mpm_event_module>
-    StartServers              4
-    MinSpareThreads          25
-    MaxSpareThreads          75
-    ThreadLimit              64
-    ThreadsPerChild          25
-    MaxRequestWorkers       400
-    MaxConnectionsPerChild 10000
-</IfModule>
-MPMTUNEEOF
-
-            # RemoteIP + HTTPS passthrough — conf.d/*.conf is wildcard-included
-            # by default on SUSE (no a2enconf equivalent exists there).
-            cat > "${APACHE_CONF_EXTRA}/remoteip.conf" << 'RIPEOF'
-RemoteIPHeader X-Forwarded-For
-RemoteIPInternalProxy 127.0.0.1
-RemoteIPInternalProxy ::1
-SetEnvIf X-Forwarded-Proto https HTTPS=on
-SetEnvIf X-Forwarded-Proto https REQUEST_SCHEME=https
-RIPEOF
-
-            # Patch ALL vhost files in the flat vhosts.d directory: keep port
-            # numbers but restrict to loopback IP; strip Listen/NameVirtualHost
-            # lines (httpd.conf is now the single listener authority).
-            for f in "${APACHE_VHOST_DIR}"/*.conf "${APACHE_VHOST_DIR}"/*.vhost; do
-                [[ -f "$f" ]] || continue
-                sed -i \
-                    -e "s|<VirtualHost \*:\([0-9]*\)>|<VirtualHost ${APACHE_BACKEND_IP}:\1>|g" \
-                    -e "s|<VirtualHost _default_:\([0-9]*\)>|<VirtualHost ${APACHE_BACKEND_IP}:\1>|g" \
-                    -e '/^[[:space:]]*Listen /d' \
-                    -e '/^[[:space:]]*NameVirtualHost/d' \
-                    -e '/SSLEngine [Oo]n/d' \
-                    -e '/SSLCertificateFile/d' \
-                    -e '/SSLCertificateKeyFile/d' \
-                    -e '/SSLCertificateChainFile/d' \
-                    -e '/SSLCACertificateFile/d' \
-                    -e '/SSLProtocol/d' \
-                    -e '/SSLCipherSuite/d' \
-                    -e '/SSLHonorCipherOrder/d' \
-                    "$f"
-            done
-
-            systemctl restart "${APACHE_SERVICE}"
+            config_dirs=("${APACHE_CONF_DIR}" "${APACHE_VHOST_DIR}" "${APACHE_CONF_EXTRA}")
             ;;
-
-        # RHEL-family
         *)
-            # Switch to Event MPM
-            if [[ -f /etc/httpd/conf.modules.d/00-mpm.conf ]]; then
-                cat > /etc/httpd/conf.modules.d/00-mpm.conf << 'MPMEOF'
-# LoadModule mpm_prefork_module modules/mod_mpm_prefork.so
-# LoadModule mpm_worker_module  modules/mod_mpm_worker.so
-LoadModule mpm_event_module   modules/mod_mpm_event.so
-MPMEOF
-            fi
-
-            # ISPConfig's default apps.vhost uses SuexecUserGroup under mod_fcgid,
-            # but the httpd package ships mod_suexec.so without a LoadModule line —
-            # without this, httpd fails to start entirely (502 from nginx in front).
-            # This base image's httpd.conf hand-lists every LoadModule directly
-            # (matching casjay-base/rhel/etc/httpd/conf/httpd.conf) with no
-            # IncludeOptional conf.modules.d/*.conf, so a conf.modules.d drop-in
-            # is silently ignored — insert the line into httpd.conf itself,
-            # right after the existing fcgid_module line it's always paired with.
-            if [[ -f /etc/httpd/modules/mod_suexec.so ]] \
-                && ! grep -q -- "^[[:space:]]*LoadModule[[:space:]]\+suexec_module" "${APACHE_CONF_DIR}/conf/httpd.conf"; then
-                sed -i '/^LoadModule fcgid_module /a LoadModule suexec_module modules/mod_suexec.so' \
-                    "${APACHE_CONF_DIR}/conf/httpd.conf"
-            fi
-
-            # ISPConfig writes its panel port from autoinstall.ini (ispconfig_port)
-            # but the apps port is hardcoded by ISPConfig (panel_port is NOT +1).
-            # Discover actual ports from the generated vhost files so we listen on
-            # the right ports regardless of ISPConfig version defaults.
-            local ispc_admin_port ispc_apps_port
-            ispc_admin_port=$(grep -h -- "^[[:space:]]*Listen[[:space:]]" \
-                "${APACHE_CONF_DIR}/conf/sites-available/ispconfig.vhost" 2>/dev/null | \
-                awk '{print $2}' | head -1)
-            ispc_apps_port=$(grep -h -- "^[[:space:]]*Listen[[:space:]]" \
-                "${APACHE_CONF_DIR}/conf/sites-available/apps.vhost" 2>/dev/null | \
-                awk '{print $2}' | head -1)
-            [[ -n "$ispc_admin_port" ]] && APACHE_ADMIN_PORT="$ispc_admin_port"
-            [[ -n "$ispc_apps_port"  ]] && APACHE_APPS_PORT="$ispc_apps_port"
-            __log "ISPConfig panel port: ${APACHE_ADMIN_PORT}, apps port: ${APACHE_APPS_PORT}"
-            __save_var APACHE_ADMIN_PORT
-            __save_var APACHE_APPS_PORT
-
-            # Replace public listeners and remove the obsolete Apache 2.2 vhost directive.
-            # ISPConfig's vhost files also carry Listen lines which are stripped below.
-            sed -i \
-                -e '/^[[:space:]]*Listen /d' \
-                -e '/^[[:space:]]*NameVirtualHost/d' \
-                "${APACHE_CONF_DIR}/conf/httpd.conf"
-            cat >> "${APACHE_CONF_DIR}/conf/httpd.conf" << LISTENEOF
-
-# Backend ports — loopback only (nginx terminates TLS externally)
-Listen ${APACHE_BACKEND_IP}:${APACHE_BACKEND_PORT}
-Listen ${APACHE_BACKEND_IP}:${APACHE_ADMIN_PORT}
-Listen ${APACHE_BACKEND_IP}:${APACHE_APPS_PORT}
-LISTENEOF
-
-            # Event MPM tuning
-            cat >> "${APACHE_CONF_DIR}/conf/httpd.conf" << 'MPMTUNEEOF'
-
-<IfModule mpm_event_module>
-    StartServers              4
-    MinSpareThreads          25
-    MaxSpareThreads          75
-    ThreadLimit              64
-    ThreadsPerChild          25
-    MaxRequestWorkers       400
-    MaxConnectionsPerChild 10000
-</IfModule>
-MPMTUNEEOF
-
-            # RemoteIP + HTTPS passthrough (mod_remoteip is in the base httpd package)
-            cat > "${APACHE_CONF_EXTRA}/remoteip.conf" << 'RIPEOF'
-RemoteIPHeader X-Forwarded-For
-RemoteIPInternalProxy 127.0.0.1
-RemoteIPInternalProxy ::1
-SetEnvIf X-Forwarded-Proto https HTTPS=on
-SetEnvIf X-Forwarded-Proto https REQUEST_SCHEME=https
-RIPEOF
-
-            # Patch ALL vhost files:
-            #   - Standard conf.d (PHP, fcgid, etc.)
-            #   - ISPConfig's sites-available and sites-enabled directories
-            # Strategy: keep port numbers but restrict to loopback IP; strip
-            # Listen/NameVirtualHost lines (httpd.conf is now the single listener authority).
-            for vhost_dir in "${APACHE_VHOST_DIR}" \
-                             "${APACHE_CONF_DIR}/conf/sites-available" \
-                             "${APACHE_CONF_DIR}/conf/sites-enabled"; do
-                [[ -d "$vhost_dir" ]] || continue
-                for f in "${vhost_dir}"/*.conf "${vhost_dir}"/*.vhost; do
-                    [[ -f "$f" ]] || continue
-                    sed -i \
-                        -e "s|<VirtualHost \*:\([0-9]*\)>|<VirtualHost ${APACHE_BACKEND_IP}:\1>|g" \
-                        -e "s|<VirtualHost _default_:\([0-9]*\)>|<VirtualHost ${APACHE_BACKEND_IP}:\1>|g" \
-                        -e '/^[[:space:]]*Listen /d' \
-                        -e '/^[[:space:]]*NameVirtualHost/d' \
-                        -e '/SSLEngine [Oo]n/d' \
-                        -e '/SSLCertificateFile/d' \
-                        -e '/SSLCertificateKeyFile/d' \
-                        -e '/SSLCertificateChainFile/d' \
-                        -e '/SSLCACertificateFile/d' \
-                        -e '/SSLProtocol/d' \
-                        -e '/SSLCipherSuite/d' \
-                        -e '/SSLHonorCipherOrder/d' \
-                        "$f"
-                done
-            done
-
-            # Fix ISPConfig panel PHP-FCGI starters: point to actual installed PHP-CGI.
-            # On RHEL-family, PHP-CGI lives under /opt/remi/phpXX/root/usr/bin/php-cgi
-            # (no system-wide /usr/bin/php-cgi); PHPRC is /etc/opt/remi/phpXX/.
-            local rhel_php_cgi=""
-            local rhel_php_ver=""
-            for _v in 85 84 83 82 81 80 74; do
-                local _bin="/opt/remi/php${_v}/root/usr/bin/php-cgi"
-                if [[ -x "$_bin" ]]; then
-                    rhel_php_cgi="$_bin"
-                    rhel_php_ver="${_v:0:1}.${_v:1}"
-                    break
+            local module module_file module_loads="" module_tmp
+            for module in ssl proxy proxy_http headers rewrite proxy_fcgi; do
+                module_file="${APACHE_CONF_DIR}/modules/mod_${module}.so"
+                if [[ -f "$module_file" ]] \
+                    && ! grep -Rqs -- "^[[:space:]]*LoadModule[[:space:]]\+${module}_module" "${APACHE_CONF_DIR}/conf.modules.d" "$listen_file" 2>/dev/null; then
+                    module_loads+="LoadModule ${module}_module modules/mod_${module}.so\n"
                 fi
             done
-            if [[ -n "$rhel_php_cgi" ]]; then
-                local rhel_phprc="/etc/opt/remi/php${rhel_php_ver//./}/"
-                for starter in /var/www/php-fcgi-scripts/ispconfig/.php-fcgi-starter \
-                               /var/www/php-fcgi-scripts/apps/.php-fcgi-starter; do
-                    [[ -f "$starter" ]] || continue
-                    local _tmp
-                    _tmp=$(mktemp)
-                    chattr -i "$starter" 2>/dev/null || true
-                    sed \
-                        -e "s|PHPRC=.*|PHPRC=${rhel_phprc}|" \
-                        -e "s|exec /usr/bin/php-cgi|exec ${rhel_php_cgi}|" \
-                        "$starter" > "$_tmp" && cp "$_tmp" "$starter"
-                    rm -f "$_tmp"
-                    __log "Patched ${starter} → ${rhel_php_cgi}"
-                done
+            if [[ -n "$module_loads" ]]; then
+                module_tmp=$(mktemp)
+                printf '%b' "$module_loads" > "$module_tmp"
+                cat "$listen_file" >> "$module_tmp"
+                cat "$module_tmp" > "$listen_file"
+                rm -f "$module_tmp"
             fi
-
-            # Validate only. Restarting here fails under SELinux enforcing because the
-            # new backend ports are not labelled http_port_t until the next step;
-            # __final_configuration restarts Apache once the policy is applied.
-            apachectl configtest
+            [[ -f /etc/httpd/conf.modules.d/00-mpm.conf ]] && cat > /etc/httpd/conf.modules.d/00-mpm.conf <<'MPMEOF'
+# LoadModule mpm_prefork_module modules/mod_mpm_prefork.so
+# LoadModule mpm_worker_module modules/mod_mpm_worker.so
+LoadModule mpm_event_module modules/mod_mpm_event.so
+MPMEOF
+            if [[ -f /etc/httpd/modules/mod_suexec.so ]] \
+                && ! grep -q -- '^[[:space:]]*LoadModule[[:space:]]\+suexec_module' "$listen_file"; then
+                sed -i '/^LoadModule fcgid_module /a LoadModule suexec_module modules/mod_suexec.so' "$listen_file"
+            fi
+            config_dirs=("${APACHE_CONF_DIR}/conf.d" "${APACHE_CONF_DIR}/conf/sites-available" "${APACHE_CONF_DIR}/conf/sites-enabled" "${APACHE_CONF_DIR}/conf/vhosts.d" "${APACHE_VHOST_DIR}")
             ;;
     esac
 
-    __success "Apache reconfigured: backend on ${APACHE_BACKEND_IP}:${APACHE_BACKEND_PORT} / admin on ${APACHE_BACKEND_IP}:${APACHE_ADMIN_PORT}"
+    [[ -e "${listen_file}.pre-ispconfig" ]] || cp -a "$listen_file" "${listen_file}.pre-ispconfig"
+    if grep -Eq -- '(:81|:8443)' "$listen_file"; then
+        [[ -e "${listen_file}.pre-ispconfig" ]] || cp -a "$listen_file" "${listen_file}.pre-ispconfig"
+        sed -i \
+            -e 's|:81>|:80>|g' \
+            -e 's|:8443>|:443>|g' \
+            -e '/^[[:space:]]*NameVirtualHost/d' "$listen_file"
+    fi
+
+    local ispc_admin_vhost="${APACHE_CONF_DIR}/conf/sites-available/ispconfig.vhost"
+    local ispc_apps_vhost="${APACHE_CONF_DIR}/conf/sites-available/apps.vhost"
+    [[ -f "${APACHE_VHOST_DIR}/ispconfig.vhost" ]] && ispc_admin_vhost="${APACHE_VHOST_DIR}/ispconfig.vhost"
+    [[ -f "${APACHE_VHOST_DIR}/apps.vhost" ]] && ispc_apps_vhost="${APACHE_VHOST_DIR}/apps.vhost"
+    local detected_admin_port detected_apps_port
+    detected_admin_port=$(awk '/^[[:space:]]*Listen[[:space:]]+[0-9]+/ {print $2; exit}' "$ispc_admin_vhost" 2>/dev/null || true)
+    detected_apps_port=$(awk '/^[[:space:]]*Listen[[:space:]]+[0-9]+/ {print $2; exit}' "$ispc_apps_vhost" 2>/dev/null || true)
+    APACHE_ADMIN_PORT="${detected_admin_port:-7080}"
+    APACHE_APPS_PORT="${detected_apps_port:-7081}"
+
+    local vhost_dir file
+    for vhost_dir in "${config_dirs[@]}"; do
+        [[ -d "$vhost_dir" ]] || continue
+        while IFS= read -r -d '' file; do
+            if grep -Eq -- '(:81|:8443|^[[:space:]]*Listen[[:space:]])' "$file"; then
+                [[ -e "${file}.pre-ispconfig" ]] || cp -a "$file" "${file}.pre-ispconfig"
+                sed -i \
+                    -e 's|:81>|:80>|g' \
+                    -e 's|:8443>|:443>|g' \
+                    -e '/^[[:space:]]*Listen[[:space:]]/d' \
+                    -e '/^[[:space:]]*NameVirtualHost/d' "$file"
+            fi
+        done < <(find "$vhost_dir" -maxdepth 1 -type f \( -name '*.conf' -o -name '*.vhost' \) -print0 2>/dev/null)
+    done
+
+    [[ -e "${listen_file}.pre-ispconfig" ]] || cp -a "$listen_file" "${listen_file}.pre-ispconfig"
+    sed -i '/^[[:space:]]*Listen[[:space:]]/d' "$listen_file"
+    cat >> "$listen_file" <<LISTENEOF
+
+# ISPConfig direct web and panel listeners
+Listen 80
+Listen 443
+Listen 127.0.0.1:${APACHE_ADMIN_PORT}
+Listen 127.0.0.1:${APACHE_APPS_PORT}
+LISTENEOF
+
+    rm -f "${APACHE_CONF_EXTRA}/remoteip.conf" "${APACHE_CONF_DIR}/conf-available/remoteip.conf" \
+        "${APACHE_CONF_EXTRA}/forwarded-https.conf" "${APACHE_CONF_DIR}/conf-available/forwarded-https.conf"
+
+    case "$PACKAGE_MANAGER" in
+        apt) a2disconf remoteip forwarded-https 2>/dev/null || true ;;
+    esac
+
+    if [[ "$DISTRO" == opensuse || "$DISTRO" == opensuse-leap || "$DISTRO" == sles ]]; then
+        cat >> "${APACHE_CONF_DIR}/httpd.conf" <<'MPMTUNEEOF'
+
+<IfModule mpm_event_module>
+    StartServers 4
+    MinSpareThreads 25
+    MaxSpareThreads 75
+    ThreadLimit 64
+    ThreadsPerChild 25
+    MaxRequestWorkers 400
+    MaxConnectionsPerChild 10000
+</IfModule>
+MPMTUNEEOF
+    fi
+
+    __save_var APACHE_ADMIN_PORT
+    __save_var APACHE_APPS_PORT
+
+    local php_cgi_bin="" php_ver="" php_rc="" starter starter_tmp starter_attrs restore_immutable
+    if [[ "$PACKAGE_MANAGER" == apt ]]; then
+        php_cgi_bin=$(update-alternatives --query php-cgi 2>/dev/null | awk '/^Value:/ {print $2}')
+        [[ -n "$php_cgi_bin" ]] || php_cgi_bin=$(command -v "php-cgi${PHP_DEFAULT}" || command -v php-cgi 2>/dev/null || true)
+        php_ver=$(printf '%s' "${php_cgi_bin##*/}" | grep -oE -- '[0-9]+\.[0-9]+' | head -1)
+        [[ -n "$php_ver" ]] || php_ver="$PHP_DEFAULT"
+        php_rc="/etc/php/${php_ver}/cgi/"
+    else
+        local php_digits
+        for php_ver in "${PHP_VERSIONS[@]}"; do
+            php_digits="${php_ver//./}"
+            php_cgi_bin="/opt/remi/php${php_digits}/root/usr/bin/php-cgi"
+            [[ -x "$php_cgi_bin" ]] && break
+            php_cgi_bin=""
+        done
+        [[ -n "$php_cgi_bin" ]] && php_rc="/etc/opt/remi/php${php_digits}/"
+    fi
+    if [[ -n "$php_cgi_bin" ]]; then
+        for starter in /var/www/php-fcgi-scripts/ispconfig/.php-fcgi-starter \
+                       /var/www/php-fcgi-scripts/apps/.php-fcgi-starter; do
+            [[ -f "$starter" ]] || continue
+            starter_tmp=$(mktemp)
+            starter_attrs=$(lsattr -d "$starter" 2>/dev/null | awk '{print $1}')
+            restore_immutable=false
+            [[ "$starter_attrs" == *i* ]] && restore_immutable=true
+            chattr -i "$starter" 2>/dev/null || true
+            sed \
+                -e "s|^PHPRC=.*|PHPRC=${php_rc}|" \
+                -e "s|^exec /usr/bin/php-cgi|exec ${php_cgi_bin}|" \
+                "$starter" > "$starter_tmp"
+            cp "$starter_tmp" "$starter"
+            [[ "$restore_immutable" == true ]] && chattr +i "$starter" 2>/dev/null || true
+            rm -f "$starter_tmp"
+        done
+    fi
+
+    apachectl configtest
+    __log "Apache listens directly on :80 and :443; ISPConfig panel remains on :${APACHE_ADMIN_PORT} internally"
 }
 
 # ── SELinux labels (RHEL-family) ─────────────────────────────────────────────
 # Everything ISPConfig creates is born unconfined_u:usr_t / httpd_sys_content_t,
-# which httpd_t and httpd_suexec_t may not read or write. Without these labels
-# httpd and nginx are denied name_bind on the custom ports (both services fail
-# to start), nginx cannot proxy to the Apache backend (502 on every request),
-# and the panel dies inside mod_fcgid. None of it is visible in the install
-# output, and __step would report [OK] regardless.
+# which httpd_t and httpd_suexec_t may not read or write. Preserve the labels
+# required by ISPConfig's CGI, vlogger, and writable runtime paths.
 __configure_selinux() {
     if ! command -v semanage >/dev/null 2>&1; then
         __warn "semanage not available — skipping SELinux labelling"
@@ -1856,17 +1436,13 @@ __configure_selinux() {
 
     __log "Applying SELinux policy for ISPConfig..."
 
-    # 1. nginx must be allowed to open network sockets and proxy to Apache.
+    # Apache proxies the panel request to its local ISPConfig listener.
     setsebool -P httpd_can_network_connect on
-    setsebool -P httpd_can_network_relay on 2>/dev/null || true
     setsebool -P httpd_enable_homedirs on 2>/dev/null || true
 
-    # 2. Custom ports need an explicit http_port_t label or name_bind is denied
-    #    and the service refuses to start. Covers the public ports, the loopback
-    #    Apache backend ports, and the panel port.
+    # ISPConfig's internal panel and apps listeners need the Apache port type.
     local p
-    for p in 80 443 7080 8081 "$ADMIN_PORT" "$APACHE_BACKEND_PORT" \
-             "$APACHE_ADMIN_PORT" "$APACHE_APPS_PORT"; do
+    for p in "$APACHE_ADMIN_PORT" "$APACHE_APPS_PORT"; do
         [[ "$p" =~ ^[0-9]+$ ]] || continue
         semanage port -d -t transproxy_port_t -p tcp "$p" 2>/dev/null || true
         semanage port -d -t unreserved_port_t -p tcp "$p" 2>/dev/null || true
@@ -1951,187 +1527,101 @@ __configure_selinux() {
     __success "SELinux policy applied (ports, booleans, file contexts)"
 }
 
-# ── ISPConfig + Nginx wiring ──────────────────────────────────────────────────
-__configure_ispconfig_nginx() {
-    __log "Wiring ISPConfig to Nginx reverse proxy..."
+# ── ISPConfig panel hostname on Apache ────────────────────────────────────────
+__configure_ispconfig_apache() {
+    local panel_conf="${APACHE_VHOST_DIR}/10-ispconfig-panel.conf"
+    local ssl_conf="${APACHE_CONF_EXTRA}/ispconfig-ssl.conf"
+    mkdir -p "${APACHE_CONF_EXTRA}" "${APACHE_VHOST_DIR}"
+    cat > "$ssl_conf" <<'SSLEOF'
+SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1
+SSLEOF
 
-    local ISPC_CONF="/usr/local/ispconfig/server/conf"
-    local ISPC_CONF_CUSTOM="/usr/local/ispconfig/server/conf-custom"
-    mkdir -p "$ISPC_CONF_CUSTOM"
+    case "$PACKAGE_MANAGER" in
+        apt)
+            a2enmod proxy proxy_http headers ssl rewrite
+            a2enconf ispconfig-ssl
+            cat > "$panel_conf" <<PANELEOF
+<VirtualHost *:80>
+    ServerName ${PANEL_HOSTNAME}
+    Redirect permanent / https://${PANEL_HOSTNAME}/
+</VirtualHost>
 
-    # Patch ISPConfig vhost templates so newly-created sites land on the backend port
-    if [[ -d "$ISPC_CONF" ]]; then
-        for tpl in "$ISPC_CONF"/*.master; do
-            [[ -f "$tpl" ]] || continue
-            sed -i \
-                -e "s/<VirtualHost \*:80>/<VirtualHost ${APACHE_BACKEND_IP}:${APACHE_BACKEND_PORT}>/g" \
-                -e "s/<VirtualHost \*:443>/<VirtualHost ${APACHE_BACKEND_IP}:${APACHE_BACKEND_PORT}>/g" \
-                -e "s/<VirtualHost {ip}:80>/<VirtualHost ${APACHE_BACKEND_IP}:${APACHE_BACKEND_PORT}>/g" \
-                -e "s/<VirtualHost {ip}:443>/<VirtualHost ${APACHE_BACKEND_IP}:${APACHE_BACKEND_PORT}>/g" \
-                -e '/SSLEngine on/d' \
-                -e '/SSLCertificateFile/d' \
-                -e '/SSLCertificateKeyFile/d' \
-                -e '/SSLCertificateChainFile/d' \
-                "$tpl"
-        done
-        __log "ISPConfig Apache templates patched"
-    fi
+<VirtualHost *:443>
+    ServerName ${PANEL_HOSTNAME}
+    SSLEngine on
+    SSLCertificateFile ${PANEL_CERT_FILE}
+    SSLCertificateKeyFile ${PANEL_KEY_FILE}
+    Header always set Strict-Transport-Security "max-age=31536000"
+    ProxyPreserveHost On
+    RequestHeader set X-Forwarded-Proto "https"
+    ProxyPass / http://${APACHE_BACKEND_IP}:${APACHE_ADMIN_PORT}/ connectiontimeout=5 timeout=300
+    ProxyPassReverse / http://${APACHE_BACKEND_IP}:${APACHE_ADMIN_PORT}/
+</VirtualHost>
+PANELEOF
+            a2ensite 10-ispconfig-panel
+            ;;
+        *)
+            cat > "$panel_conf" <<PANELEOF
+<VirtualHost *:80>
+    ServerName ${PANEL_HOSTNAME}
+    Redirect permanent / https://${PANEL_HOSTNAME}/
+</VirtualHost>
 
-    __nginx_http2_form
+<VirtualHost *:443>
+    ServerName ${PANEL_HOSTNAME}
+    SSLEngine on
+    SSLCertificateFile ${PANEL_CERT_FILE}
+    SSLCertificateKeyFile ${PANEL_KEY_FILE}
+    Header always set Strict-Transport-Security "max-age=31536000"
+    ProxyPreserveHost On
+    RequestHeader set X-Forwarded-Proto "https"
+    ProxyPass / http://${APACHE_BACKEND_IP}:${APACHE_ADMIN_PORT}/ connectiontimeout=5 timeout=300
+    ProxyPassReverse / http://${APACHE_BACKEND_IP}:${APACHE_ADMIN_PORT}/
+</VirtualHost>
+PANELEOF
+            ;;
+    esac
 
-    # nginx vhost for ISPConfig admin panel (port ADMIN_PORT → Apache admin port)
-    cat > "${NGINX_VHOSTS_DIR}/ispconfig-panel.conf" << VHOST_EOF
-server {
-    listen      ${ADMIN_PORT} ssl${NGINX_H2_LISTEN};
-    listen      [::]:${ADMIN_PORT} ssl${NGINX_H2_LISTEN};
-${NGINX_H2_DIRECTIVE}
-    server_name _;
-
-    ssl_certificate     ${SSL_DIR}/ispconfig.crt;
-    ssl_certificate_key ${SSL_DIR}/ispconfig.key;
-
-    # The panel application sets these itself via PHP header(). If nginx adds
-    # them too, every panel response carries each header twice. Nginx owns them
-    # here and the upstream copies are hidden, so exactly one copy reaches the
-    # client regardless of what the panel emits.
-    proxy_hide_header Strict-Transport-Security;
-    proxy_hide_header Upgrade;
-    proxy_hide_header X-Content-Type-Options;
-    proxy_hide_header X-Frame-Options;
-    add_header Strict-Transport-Security "max-age=31536000" always;
-    add_header X-Content-Type-Options    nosniff always;
-    add_header X-Frame-Options           SAMEORIGIN always;
-
-    location / {
-        proxy_pass http://ispconfig_admin;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_set_header X-Forwarded-Port ${ADMIN_PORT};
-    }
-}
-VHOST_EOF
-
-    # Install nginx-sync helper — regenerates per-domain nginx vhosts from ISPConfig certs
-    cat > /usr/local/bin/ispconfig-nginx-sync << 'SYNCEOF'
-#!/bin/bash
-# Syncs nginx SSL vhosts with ISPConfig Let's Encrypt certificates.
-# Run after certbot renewal: add to /etc/letsencrypt/renewal-hooks/deploy/
-VHOSTS_DIR="/etc/nginx/vhosts.d"
-APACHE_BACKEND="127.0.0.1:81"
-cert_count=0
-
-# nginx 1.25.1+ wants "http2 on;" instead of "listen ... http2".
-H2_LISTEN=" http2"
-H2_DIRECTIVE=""
-nginx_ver=$(nginx -v 2>&1 | sed -n 's|.*nginx/\([0-9][0-9.]*\).*|\1|p')
-if [[ -n "$nginx_ver" && "$(printf '%s\n1.25.1\n' "$nginx_ver" | sort -V | head -n1)" == "1.25.1" ]]; then
-    H2_LISTEN=""
-    H2_DIRECTIVE="    http2       on;"
-fi
-
-# Stapling needs both an OCSP responder in the certificate and a local CA bundle.
-CA_BUNDLE=""
-for c in /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt \
-         /etc/pki/tls/cert.pem /etc/ssl/certs/ca-bundle.crt; do
-    [[ -f "$c" ]] && CA_BUNDLE="$c" && break
-done
-
-for cert_dir in /etc/letsencrypt/live/*/; do
-    domain="${cert_dir%/}"
-    domain="${domain##*/}"
-    vhost_file="${VHOSTS_DIR}/${domain}.conf"
-    fullchain="${cert_dir}fullchain.pem"
-    privkey="${cert_dir}privkey.pem"
-
-    [[ -f "$fullchain" && -f "$privkey" ]] || continue
-    cert_count=$((cert_count + 1))
-
-    ocsp_uri=$(openssl x509 -in "$fullchain" -noout -ocsp_uri 2>/dev/null || true)
-    STAPLING_DIRECTIVES=""
-    if [[ -n "$CA_BUNDLE" && -n "$ocsp_uri" ]]; then
-        STAPLING_DIRECTIVES="ssl_stapling on;
-    ssl_stapling_verify on;
-    ssl_trusted_certificate ${CA_BUNDLE};"
-    fi
-
-    new_content="server {
-    listen      443 ssl${H2_LISTEN};
-    listen      [::]:443 ssl${H2_LISTEN};
-${H2_DIRECTIVE}
-    server_name ${domain} www.${domain};
-
-    ssl_certificate     ${fullchain};
-    ssl_certificate_key ${privkey};
-
-    add_header Strict-Transport-Security \"max-age=31536000; includeSubDomains\" always;
-
-    # OCSP stapling is enabled only when the certificate has a responder and a
-    # local CA bundle is available.
-    ${STAPLING_DIRECTIVES}
-
-    location ^~ /.well-known/acme-challenge/ {
-        root /var/www/letsencrypt;
-        default_type text/plain;
-        try_files \$uri =404;
-    }
-
-    location / {
-        proxy_pass http://${APACHE_BACKEND};
-    }
-}"
-
-    existing_content=""
-    [[ -f "$vhost_file" ]] && existing_content=$(< "$vhost_file")
-    if [[ "$new_content" != "$existing_content" ]]; then
-        echo "$new_content" > "$vhost_file"
-    fi
-done
-
-# Certificate contents can change while the generated vhost text stays the same.
-if [[ $cert_count -gt 0 ]]; then
-    nginx -t && systemctl reload nginx
-fi
-SYNCEOF
-    chmod +x /usr/local/bin/ispconfig-nginx-sync
-
-    # Hook into certbot renewal
-    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-    ln -sf /usr/local/bin/ispconfig-nginx-sync \
-        /etc/letsencrypt/renewal-hooks/deploy/99-ispconfig-nginx-sync
-
-    __log "nginx-sync helper installed at /usr/local/bin/ispconfig-nginx-sync"
+    apachectl configtest
+    __log "ISPConfig panel configured at https://${PANEL_HOSTNAME}/"
 }
 
-# ── SSL / certs ───────────────────────────────────────────────────────────────
+# ── Apache SSL assets ─────────────────────────────────────────────────────────
 __configure_ssl() {
-    __log "Generating SSL assets for Nginx..."
+    __log "Preparing Apache SSL assets..."
     mkdir -p "$SSL_DIR"
-
-    __log "Generating DH parameters (2048-bit, takes ~30s)..."
-    openssl dhparam -out /etc/nginx/dhparam.pem 2048
-
-    # Default nginx catch-all cert
-    if [[ ! -f "${SSL_DIR}/default.crt" ]]; then
+    if [[ -n "${ISPCONFIG_PANEL_CERT:-}${ISPCONFIG_PANEL_KEY:-}" ]]; then
+        [[ -f "$PANEL_CERT_FILE" && -f "$PANEL_KEY_FILE" ]] \
+            || __error "ISPCONFIG_PANEL_CERT and ISPCONFIG_PANEL_KEY must both name readable files"
+    elif [[ ! -f "$PANEL_CERT_FILE" || ! -f "$PANEL_KEY_FILE" ]]; then
+        local cert_extensions=()
+        if openssl req -help 2>&1 | grep -q -- '-addext'; then
+            cert_extensions=(-addext "subjectAltName=DNS:${PANEL_HOSTNAME}")
+        fi
         openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-            -keyout "${SSL_DIR}/default.key" \
-            -out    "${SSL_DIR}/default.crt" \
-            -subj   "/C=US/ST=./L=./O=Default/CN=${HOSTNAME}"
+            -keyout "$PANEL_KEY_FILE" -out "$PANEL_CERT_FILE" \
+            -subj "/C=US/ST=./L=./O=ISPConfig/CN=${PANEL_HOSTNAME}" \
+            "${cert_extensions[@]}"
     fi
-
-    # ISPConfig admin panel cert (nginx uses this for :ADMIN_PORT listener)
-    if [[ ! -f "${SSL_DIR}/ispconfig.crt" ]]; then
+    if [[ ! -f "${SSL_DIR}/default.crt" || ! -f "${SSL_DIR}/default.key" ]]; then
         openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-            -keyout "${SSL_DIR}/ispconfig.key" \
-            -out    "${SSL_DIR}/ispconfig.crt" \
-            -subj   "/C=US/ST=./L=./O=ISPConfig/CN=${HOSTNAME}"
+            -keyout "${SSL_DIR}/default.key" -out "${SSL_DIR}/default.crt" \
+            -subj "/C=US/ST=./L=./O=Default/CN=${HOSTNAME}"
     fi
-
-    # If ISPConfig generated its own cert, keep a copy for reference
-    if [[ -f /usr/local/ispconfig/interface/ssl/ispserver.crt ]]; then
-        cp /usr/local/ispconfig/interface/ssl/ispserver.crt "${SSL_DIR}/ispconfig-original.crt" 2>/dev/null || true
-    fi
-
     chmod 640 "${SSL_DIR}"/*.key 2>/dev/null || true
-    __success "SSL assets generated in ${SSL_DIR}"
+
+    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+    cat > /etc/letsencrypt/renewal-hooks/deploy/99-ispconfig-apache-reload <<'HOOKEOF'
+#!/bin/bash
+if apachectl configtest; then
+    if systemctl reload apache2 2>/dev/null; then
+        exit 0
+    fi
+    systemctl reload httpd
+fi
+HOOKEOF
+    chmod 750 /etc/letsencrypt/renewal-hooks/deploy/99-ispconfig-apache-reload
+    __log "Apache SSL certificate paths: ${PANEL_CERT_FILE}, ${PANEL_KEY_FILE}"
 }
 
 # ── Final configuration ───────────────────────────────────────────────────────
@@ -2267,7 +1757,7 @@ __final_configuration() {
 }
 EOF
 
-    # Restart order matters: Apache first (nginx needs backend up)
+    # Apache serves website and panel traffic directly on ports 80 and 443.
     case "$DISTRO" in
         "ubuntu"|"debian")
             systemctl restart apache2
@@ -2286,12 +1776,7 @@ EOF
 
     systemctl restart postfix dovecot proftpd 2>/dev/null || true
     __fixup_amavisd
-    nginx -t && systemctl start nginx
-
-    # Sync any existing Let's Encrypt certs into Nginx vhosts (no-op on fresh installs)
-    if [[ -d /etc/letsencrypt/live ]]; then
-        /usr/local/bin/ispconfig-nginx-sync 2>/dev/null || true
-    fi
+    apachectl configtest
 
     # Verify the stack actually came up. A service that failed to start leaves
     # the machine unusable but every step above still reports [OK], because the
@@ -2307,7 +1792,7 @@ EOF
 __verify_services() {
     local failed=() svc
 
-    for svc in "${APACHE_SERVICE}" nginx postfix; do
+    for svc in "${APACHE_SERVICE}" postfix; do
         systemctl is-active --quiet "$svc" || failed+=("$svc")
     done
 
@@ -2337,25 +1822,20 @@ __verify_services() {
         return 1
     fi
 
-    # The panel must answer through nginx, not just be listening. 000 means the
-    # connection was refused; 5xx means the proxy chain is broken.
+    # The panel must answer through its hostname vhost on Apache TLS.
     local code
-    code=$(curl -q -sk -o /dev/null -w '%{http_code}' --max-time 20 \
-        "https://${APACHE_BACKEND_IP}:${ADMIN_PORT}/" 2>/dev/null) || true
+    code=$(curl -q -sk --resolve "${PANEL_HOSTNAME}:443:127.0.0.1" -o /dev/null \
+        -w '%{http_code}' --max-time 20 "https://${PANEL_HOSTNAME}/" 2>/dev/null) || true
     code="${code:-000}"
     case "$code" in
-        200|30[0-9])
-            __log "ISPConfig panel responding (HTTP ${code})"
-            ;;
-        000)
-            __error "ISPConfig panel unreachable on https://${APACHE_BACKEND_IP}:${ADMIN_PORT}/ (no response)"
-            return 1
-            ;;
-        *)
-            __error "ISPConfig panel returned HTTP ${code} on port ${ADMIN_PORT}"
-            return 1
-            ;;
+        200|30[0-9]) __log "ISPConfig panel responding (HTTP ${code})" ;;
+        *) __error "ISPConfig panel returned HTTP ${code} on https://${PANEL_HOSTNAME}/"; return 1 ;;
     esac
+
+    if systemctl is-active --quiet nginx; then
+        __error "Nginx is still active; Apache must be the only web listener"
+        return 1
+    fi
 }
 
 # ── Catch-all "no site" page ──────────────────────────────────────────────────
@@ -2365,8 +1845,24 @@ __verify_services() {
 __configure_nosite_page() {
     local nosite_root="/var/www/ispconfig-nosite"
     local nosite_conf="${APACHE_VHOST_DIR}/00-ispconfig-nosite.conf"
+    local main_config="" include_path=""
+    case "$PACKAGE_MANAGER" in
+        apt) ;;
+        zypper)
+            nosite_conf="${APACHE_CONF_DIR}/ispconfig-nosite.conf"
+            main_config="${APACHE_CONF_DIR}/httpd.conf"
+            include_path="$nosite_conf"
+            ;;
+        *)
+            nosite_conf="${APACHE_CONF_DIR}/conf/ispconfig-nosite.conf"
+            main_config="${APACHE_CONF_DIR}/conf/httpd.conf"
+            include_path="conf/ispconfig-nosite.conf"
+            ;;
+    esac
 
-    mkdir -p "$nosite_root"
+    mkdir -p "$nosite_root" "${LETSENCRYPT_WEBROOT}/.well-known/acme-challenge"
+    chmod 755 "${LETSENCRYPT_WEBROOT}" "${LETSENCRYPT_WEBROOT}/.well-known" \
+        "${LETSENCRYPT_WEBROOT}/.well-known/acme-challenge"
     cat > "${nosite_root}/nosite.html" << 'NOSITE_EOF'
 <!DOCTYPE html>
 <html lang="en">
@@ -2467,11 +1963,29 @@ NOSITE_EOF
     fi
     __save_var NOSITE_PHPINFO
 
-    cat > "$nosite_conf" << NOSITE_VHOST_EOF
-# Default vhost: answers 404 for any Host that matches no hosted site.
-<VirtualHost ${APACHE_BACKEND_IP}:${APACHE_BACKEND_PORT}>
+    cat > "$nosite_conf" <<NOSITE_VHOST_EOF
+# Default HTTP vhost preserves ACME validation and redirects other requests.
+<VirtualHost *:80>
     ServerName nosite.invalid
     DocumentRoot ${nosite_root}
+    Alias /.well-known/acme-challenge/ ${LETSENCRYPT_WEBROOT}/.well-known/acme-challenge/
+    <Directory ${LETSENCRYPT_WEBROOT}/.well-known/acme-challenge/>
+        Require all granted
+        Options None
+        AllowOverride None
+    </Directory>
+    RewriteEngine On
+    RewriteCond %{REQUEST_URI} !^/.well-known/acme-challenge/
+    RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L,NE]
+</VirtualHost>
+
+# Default HTTPS vhost answers 404 for hosts that do not match a site or panel.
+<VirtualHost *:443>
+    ServerName nosite.invalid
+    DocumentRoot ${nosite_root}
+    SSLEngine on
+    SSLCertificateFile ${SSL_DIR}/default.crt
+    SSLCertificateKeyFile ${SSL_DIR}/default.key
     ErrorDocument 404 /nosite.html
     RedirectMatch 404 "^/(?!(${allowed_re})\$)"
 ${php_handler}
@@ -2484,7 +1998,26 @@ ${php_handler}
 NOSITE_VHOST_EOF
 
     case "$PACKAGE_MANAGER" in
-        apt) a2ensite 00-ispconfig-nosite >/dev/null ;;
+        apt)
+            a2dissite 000-default default-ssl 2>/dev/null || true
+            a2ensite 00-ispconfig-nosite >/dev/null
+            ;;
+        *)
+            if [[ -f "$main_config" ]]; then
+                sed -i "\|^[[:space:]]*IncludeOptional ${include_path}[[:space:]]*$|d" "$main_config"
+                local first_vhost first_vhost_include
+                first_vhost_include=$(grep -n -m1 -E '^[[:space:]]*Include(Optional)?[[:space:]].*(conf\.d/|vhosts\.d/|sites-enabled/)' "$main_config" | cut -d: -f1)
+                first_vhost=$(grep -n -m1 -E '^[[:space:]]*<VirtualHost([[:space:]]|>)' "$main_config" | cut -d: -f1)
+                if [[ -n "$first_vhost_include" && ( -z "$first_vhost" || "$first_vhost_include" -lt "$first_vhost" ) ]]; then
+                    first_vhost="$first_vhost_include"
+                fi
+                if [[ -n "$first_vhost" ]]; then
+                    sed -i "${first_vhost}i IncludeOptional ${include_path}" "$main_config"
+                else
+                    printf '\nIncludeOptional %s\n' "$include_path" >> "$main_config"
+                fi
+            fi
+            ;;
     esac
 
     apachectl configtest
@@ -2524,12 +2057,11 @@ ksort($versions);
 echo "<h1>PHP Versions</h1><ul>";
 foreach ($versions as $v => $p) echo "<li><strong>PHP $v</strong>: $p</li>";
 echo "</ul>";
-echo "<p>X-Forwarded-Proto: " . htmlspecialchars($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? 'not set') . "</p>";
 echo "<p>HTTPS: " . htmlspecialchars($_SERVER['HTTPS'] ?? 'off') . "</p>";
 phpinfo();
 EOF
 
-    chown "${NGINX_USER}:${NGINX_USER}" "${web_root}/phpinfo.php" 2>/dev/null || true
+    chown "${APACHE_USER}:${APACHE_USER}" "${web_root}/phpinfo.php" 2>/dev/null || true
     chmod 644 "${web_root}/phpinfo.php"
 }
 
@@ -2538,23 +2070,21 @@ __create_summary() {
     local server_ip
     server_ip=$(hostname -I | awk '{print $1}')
 
-    cat > /root/ispconfig_installation_summary.txt << EOF
-ISPConfig Installation Summary — Nginx Reverse Proxy Architecture
-=================================================================
+    cat > /root/ispconfig_installation_summary.txt <<EOF
+ISPConfig Installation Summary — Apache Direct Architecture
+===========================================================
 Date:         $(date)
 Distribution: ${DISTRO} ${DISTRO_VERSION}
 Hostname:     ${HOSTNAME}
 Server IP:    ${server_ip}
 
 Architecture:
-  Nginx  :80             → HTTP to HTTPS redirect
-  Nginx  :443            → SSL termination → Apache ${APACHE_BACKEND_IP}:${APACHE_BACKEND_PORT}
-  Nginx  :${ADMIN_PORT}          → SSL termination → Apache ${APACHE_BACKEND_IP}:${APACHE_ADMIN_PORT}
-  Apache ${APACHE_BACKEND_IP}:${APACHE_BACKEND_PORT} → PHP-FPM, .htaccess, ISPConfig sites
-  Apache ${APACHE_BACKEND_IP}:${APACHE_ADMIN_PORT}   → ISPConfig control panel
+  Apache :80        → website vhosts, ACME challenge, HTTP to HTTPS redirect for unknown hosts
+  Apache :443       → website vhosts, HTTPS catch-all 404, ISPConfig panel hostname
+  Apache 127.0.0.1:${APACHE_ADMIN_PORT} → ISPConfig control panel backend
 
 Credentials:
-  ISPConfig panel:    https://${server_ip}:${ADMIN_PORT}
+  ISPConfig panel:    https://${PANEL_HOSTNAME}/
   ISPConfig username: ${ISPCONFIG_ADMIN_USER}
   ISPConfig password: ${ISPCONFIG_ADMIN_PASSWORD}
 
@@ -2564,11 +2094,10 @@ Credentials:
   ISPConfig DB user:  ispconfig
   ISPConfig DB pass:  ${ISPCONFIG_DB_PASSWORD}
 
-SSL certificates (self-signed, replace with Let's Encrypt):
+SSL certificates (self-signed by default; replace with Let's Encrypt):
   Default:    ${SSL_DIR}/default.{crt,key}
-  ISPConfig:  ${SSL_DIR}/ispconfig.{crt,key}
+  ISPConfig:  ${PANEL_CERT_FILE} and ${PANEL_KEY_FILE}
   Mail TLS:   /usr/local/ispconfig/interface/ssl/ispserver.{crt,key}
-  DH params:  /etc/nginx/dhparam.pem
 
 Mail server ports (the sysadmin must open these externally according to site policy):
   25   — SMTP (inbound from internet, MX delivery)
@@ -2590,33 +2119,26 @@ DKIM (required for reliable delivery to Gmail, Yahoo, Outlook):
        _dmarc.yourdomain.com  TXT  "v=DMARC1; p=quarantine; rua=mailto:admin@yourdomain.com"
   5. Set PTR (reverse DNS) for ${server_ip} → ${HOSTNAME} with your VPS provider
 
-Nginx vhosts drop-in dir: ${NGINX_VHOSTS_DIR}/
-  Drop *.conf files here for custom apps (node, ruby, go, etc.)
-  Run: nginx -t && systemctl reload nginx
-
 Let's Encrypt:
   ACME webroot: ${LETSENCRYPT_WEBROOT}
-  After cert issue, run: /usr/local/bin/ispconfig-nginx-sync
-  Auto-runs on certbot renewal via deploy hook.
+  Apache reload deploy hook: /etc/letsencrypt/renewal-hooks/deploy/99-ispconfig-apache-reload
+  Panel certificate paths: ${PANEL_CERT_FILE} and ${PANEL_KEY_FILE}
 
 Important files:
   /usr/local/ispconfig/          ISPConfig root
-  /etc/nginx/nginx.conf          Nginx config
-  ${NGINX_VHOSTS_DIR}/           Nginx virtual hosts
-  ${APACHE_CONF_DIR}/            Apache config
+  ${APACHE_CONF_DIR}/            Apache configuration
+  ${APACHE_CONF_EXTRA}/ispconfig-panel.conf  Panel hostname vhost
   /etc/postfix/main.cf           Postfix config
   /etc/dovecot/conf.d/           Dovecot config
   /etc/opendkim.conf             OpenDKIM config
   /root/.my.cnf                  MySQL root credentials
 
 Next steps:
-  1. Log in: https://${server_ip}:${ADMIN_PORT}
-  2. Replace self-signed certs with Let's Encrypt
-  3. Run ispconfig-nginx-sync after first cert issuance
-  4. Configure DKIM/SPF/DMARC DNS records (see above)
-  5. Set reverse DNS (PTR) for your server IP with your VPS provider
-  6. Drop custom app vhosts in ${NGINX_VHOSTS_DIR}/
-  7. Replace self-signed certs with Let's Encrypt before going live
+  1. Point ${PANEL_HOSTNAME} to ${server_ip} and log in at https://${PANEL_HOSTNAME}/
+  2. Replace the self-signed panel/default certificates with valid Let's Encrypt certificates
+  3. Configure DKIM/SPF/DMARC DNS records (see above)
+  4. Set reverse DNS (PTR) for your server IP with your VPS provider
+  5. Configure hosted sites and certificates in ISPConfig
 EOF
 
     chmod 0600 /root/ispconfig_installation_summary.txt
@@ -2627,7 +2149,7 @@ EOF
 __main() {
     echo -e "${PURPLE}"
     echo "============================================"
-    echo "  ISPConfig — Nginx Reverse Proxy Installer"
+    echo "  ISPConfig — Apache Direct Installer"
     echo "============================================"
     echo -e "${NC}"
 
@@ -2641,7 +2163,7 @@ __main() {
 
     __step "Updating system packages"          __update_system
     __step "Installing base packages"          __install_base_packages
-    __step "Installing Nginx"                  __install_nginx
+    __step "Disabling existing Nginx"          __disable_nginx
     __step "Installing Apache"                 __install_apache
     __step "Installing MySQL/MariaDB"          __install_mysql
     __step "Installing PHP versions"           __install_php
@@ -2654,9 +2176,9 @@ __main() {
 
     __step "Configuring Apache backend"        __configure_apache_backend
     __step "Applying SELinux policy"           __configure_selinux
-    __step "Configuring Nginx for ISPConfig"   __configure_ispconfig_nginx
-    __step "Configuring public mail records"   __configure_mail_public
     __step "Configuring SSL"                   __configure_ssl
+    __step "Configuring Apache panel hostname" __configure_ispconfig_apache
+    __step "Configuring public mail records"   __configure_mail_public
 
     __step "Installing no-site catch-all page" __configure_nosite_page
     __step "Finalizing configuration"          __final_configuration
@@ -2686,7 +2208,7 @@ __main() {
     echo -e "${NC}"
     local server_ip
     server_ip=$(hostname -I | awk '{print $1}')
-    __log "ISPConfig panel:    https://${server_ip}:${ADMIN_PORT}"
+    __log "ISPConfig panel:    https://${PANEL_HOSTNAME}/"
     __log "ISPConfig username: ${ISPCONFIG_ADMIN_USER}"
     __log "ISPConfig password: ${admin_pass}"
     __log "MySQL root user:    root"
