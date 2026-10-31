@@ -32,7 +32,9 @@ Set any of these variables before running the installer to choose credentials. I
 | `ISPCONFIG_ADMIN_USER` | `admin` | ISPConfig panel username |
 | `ISPCONFIG_DB_PASSWORD` | Generated | Password for the ISPConfig database user |
 | `ISPCONFIG_PHPINFO` | Disabled | Set to `1` to create the public `phpinfo.php` diagnostic page; see [Test PHP versions](#test-php-versions) |
-| `ISPCONFIG_PANEL_HOSTNAME` | `panel.casjay.app` | Hostname used for the ISPConfig panel vhost |
+| `ISPCONFIG_HOSTNAME` | Detected | Server FQDN; detected from the system hostname and domain |
+| `ISPCONFIG_DOMAIN` | Detected | Domain part of the FQDN; detected from the hostname, then the resolver search domain |
+| `ISPCONFIG_PANEL_HOSTNAME` | `panel.<domain>` | Hostname for the ISPConfig panel vhost; the server FQDN when the domain is `local`, `internal` or similar |
 | `ISPCONFIG_PANEL_CERT` | Generated self-signed certificate | Absolute certificate file path; set together with `ISPCONFIG_PANEL_KEY` |
 | `ISPCONFIG_PANEL_KEY` | Generated private key | Absolute private key path; set together with `ISPCONFIG_PANEL_CERT` |
 
@@ -66,16 +68,16 @@ Passwords may not contain quotes, backslashes, backticks, dollar signs or whites
 
 | Distribution | Versions | Package Manager | Status |
 |---|---|---|---|
-| **Ubuntu** | 18.04–24.04 | apt | ✅ 24.04 tested |
+| **Ubuntu** | 18.04–24.04 | apt | ✅ 22.04 and 24.04 tested |
 | **Ubuntu** | 25.x, 26.04 | apt | ⚠️ experimental — PHP 8.5 only; Dovecot 2.4 config pending |
-| **Debian** | 9, 10, 11, 12, 13 | apt | ✅ 12 tested |
+| **Debian** | 9, 10, 11, 12, 13 | apt | ✅ 12 and 13 tested |
 | **AlmaLinux** | 8, 9, 10 | dnf | ✅ 9 tested |
-| **Rocky Linux** | 8, 9, 10 | dnf | supported, untested |
+| **Rocky Linux** | 8, 9, 10 | dnf | ✅ 9 tested |
 | **CentOS / RHEL** | 7, 8, 9 | yum / dnf | ⚠️ use at own risk — requires active subscription |
 | **Fedora** | 36–49 | dnf | supported, untested |
 | **openSUSE Leap / SLES** | 15.x | zypper | supported, untested |
 
-> **RHEL note:** This script is tested against AlmaLinux (a free RHEL rebuild). Vanilla RHEL requires an active subscription for package repos and uses different repo names for CodeReady Builder — the script may need manual repo adjustments. Rocky Linux 9 is expected to work identically to AlmaLinux 9 but has not been tested.
+> **RHEL note:** This script is tested against AlmaLinux (a free RHEL rebuild). Vanilla RHEL requires an active subscription for package repos and uses different repo names for CodeReady Builder — the script may need manual repo adjustments. Rocky Linux 9 was tested and behaves like AlmaLinux 9.
 
 > **Ubuntu 25.x / 26.04 note:** These releases are detected and partially supported. The Ondrej PHP PPA does not yet carry packages for these codenames, so only the PHP version shipped natively by Ubuntu (8.5 on 26.04) is installed. Ubuntu 26.04 ships Dovecot 2.4, which has a breaking configuration format change (new `dovecot_config_version` header required, renamed settings, `passdb`/`userdb` block syntax change); full Dovecot 2.4 support is pending.
 
@@ -92,7 +94,7 @@ Apache :443       → hosted HTTPS vhosts, default 404, ISPConfig panel hostname
 Apache 127.0.0.1:7080 → ISPConfig panel backend
 ```
 
-Apache serves ISPConfig-managed sites directly, including `.htaccess` rules and PHP handlers. The panel is exposed through `ISPCONFIG_PANEL_HOSTNAME` (default `panel.casjay.app`) over HTTPS. The installer creates a self-signed certificate unless certificate and key paths are supplied through `ISPCONFIG_PANEL_CERT` and `ISPCONFIG_PANEL_KEY`. Certbot renewals reload Apache through a deploy hook.
+Apache serves ISPConfig-managed sites directly, including `.htaccess` rules and PHP handlers. The panel is exposed through `ISPCONFIG_PANEL_HOSTNAME` (default `panel.<domain>`, detected from the server's domain) over HTTPS. The installer creates a self-signed certificate unless certificate and key paths are supplied through `ISPCONFIG_PANEL_CERT` and `ISPCONFIG_PANEL_KEY`. Certbot renewals reload Apache through a deploy hook.
 
 ---
 
@@ -126,7 +128,7 @@ Username: admin (unless overridden)
 Password: see /root/ispconfig_installation_summary.txt
 ```
 
-The default panel hostname is `panel.casjay.app`. Set `ISPCONFIG_PANEL_HOSTNAME` to choose a different name, and point its DNS record at the server. Certificate and key overrides must be supplied together.
+The panel hostname is `panel.<domain>`, where the domain is detected from the server's FQDN (or the server FQDN itself when the domain is `local`, `internal` or another non-public name). Set `ISPCONFIG_PANEL_HOSTNAME`, `ISPCONFIG_HOSTNAME` or `ISPCONFIG_DOMAIN` to choose different names, and point the panel's DNS record at the server. Certificate and key overrides must be supplied together.
 
 ### Summary file
 
@@ -193,7 +195,7 @@ The installer configures **no firewall** — allow inbound ports below if you se
 | 22 | SSH | Public — **keep this open or you will lock yourself out** |
 | 25, 465, 587 | Postfix SMTP / SMTPS / submission | Public if mail is used |
 | 110, 143, 993, 995 | Dovecot POP3 / IMAP / IMAPS / POP3S | Public if mail is used |
-| 7080, 7081 | ISPConfig internal Apache listeners | Loopback only — never open |
+| 7080, 8081 | ISPConfig internal Apache listeners (panel backend and apps vhost; ports are read from ISPConfig's vhosts) | Loopback only — never open |
 
 ### Add a custom Apache vhost
 
@@ -307,7 +309,7 @@ Root access is required.
 - All passwords are randomly generated at install time and saved to `/root/ispconfig_installation_summary.txt` (mode `0600`) — the installer verifies them against the live system before exiting
 - SSL certificates are self-signed at install — replace with Let's Encrypt before serving traffic. OCSP stapling is enabled only for certificates with an OCSP responder URI and an available local CA bundle.
 - **The installer configures no firewall.** firewalld/ufw/nftables are left exactly as the base image shipped them — on AlmaLinux that means `iptables` policies `ACCEPT` with no rules. Every port the panel and mail stack bind is world-reachable. Enable and configure a firewall yourself before serving traffic; the ports to open are in [Key Paths](#-key-paths)
-- Requests for a hostname with no configured site get a `404` "No site at this address" page (static HTML/CSS, no JavaScript) from a catch-all Apache vhost, `00-ispconfig-nosite.conf`, instead of the distro test page
+- Requests for a hostname with no configured site get a `404` "No site at this address" page (static HTML/CSS, no JavaScript) from a catch-all Apache vhost (`00-ispconfig-nosite.conf` on Debian/Ubuntu, `ispconfig-nosite.conf` on RHEL-family and openSUSE), instead of the distro test page
 - Set a PTR record (reverse DNS) for your IP — required for reliable mail delivery
 
 ---

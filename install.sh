@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202610111745-git
+##@Version           :  202610311334-git
 # @@Author           :  ISPConfig Universal Installer Contributors
 # @@Contact          :  https://github.com/scriptmgr/ispconfig
 # @@License          :  MIT
@@ -10,7 +10,7 @@
 # @@Created          :  Monday, August 24, 2026 15:34 EDT
 # @@File             :  install.sh
 # @@Description      :  Universal distro-agnostic ISPConfig installer with Apache direct hosting, multi-PHP, and full mail stack
-# @@Changelog        :  See git log for full history; latest: 404 catch-all page for unconfigured hosts, env credential overrides, DNS enable on boot
+# @@Changelog        :  See git log for full history; latest: Apache direct hosting on 80/443, panel on a configurable hostname, 404 catch-all, retry and base-image hardening
 # @@TODO             :  none
 # @@Other            :  none
 # @@Resource         :  https://www.ispconfig.org/
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202610111745-git"
+VERSION="202610311334-git"
 
 # Universal ISPConfig Installation Script
 # Architecture: Apache direct listeners on :80/:443; ISPConfig panel on configured hostname
@@ -69,7 +69,10 @@ PHP_VERSIONS=("8.5" "8.4" "8.3" "8.2" "8.1" "8.0" "7.4")
 APACHE_BACKEND_IP="127.0.0.1"
 APACHE_ADMIN_PORT="7080"
 APACHE_APPS_PORT="7081"
-PANEL_HOSTNAME="${ISPCONFIG_PANEL_HOSTNAME:-panel.casjay.app}"
+# Detected by __detect_hostname; override with ISPCONFIG_HOSTNAME, ISPCONFIG_DOMAIN
+# and ISPCONFIG_PANEL_HOSTNAME.
+DOMAIN=""
+PANEL_HOSTNAME="${ISPCONFIG_PANEL_HOSTNAME:-}"
 LETSENCRYPT_WEBROOT="/var/www/letsencrypt"
 SSL_DIR="/etc/ssl/ispconfig"
 PANEL_CERT_FILE="${ISPCONFIG_PANEL_CERT:-/etc/ssl/ispconfig/ispconfig.crt}"
@@ -112,14 +115,15 @@ __spin() {
     done
 }
 
-# Runs a function quietly: stdout/stderr are captured to a temp log instead
-# of streaming to the terminal, a spinner shows progress, and the result
-# collapses to one line — "[OK]" on success, or __failed's report on failure.
+# Records a variable in STATE_FILE so later steps see a value set inside a step.
 __save_var() {
     [[ -n "$STATE_FILE" ]] && printf '%s=%q\n' "$1" "${!1}" >> "$STATE_FILE"
     return 0
 }
 
+# Runs a function quietly: stdout/stderr are captured to a temp log instead
+# of streaming to the terminal, a spinner shows progress, and the result
+# collapses to one line — "[OK]" on success, or __failed's report on failure.
 __step() {
     local desc="$1"; shift
     local logfile spin_pid rc
@@ -278,6 +282,12 @@ Supported: Ubuntu 18-26, Debian 9-13, CentOS/RHEL 7-9, AlmaLinux/Rocky 8-10, Fed
     __success "Distribution $DISTRO $DISTRO_VERSION is supported (${PACKAGE_MANAGER})"
 }
 
+# True when $1 is a syntactically valid fully-qualified DNS hostname.
+__is_fqdn() {
+    [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ \
+        && ${#1} -le 253 ]]
+}
+
 # ── Passwords ─────────────────────────────────────────────────────────────────
 # Supplied credentials are embedded in SQL strings, PHP config and the
 # ISPConfig answer file, so characters that would break any of those are
@@ -296,9 +306,11 @@ __generate_passwords() {
     if [[ -n "$ISPCONFIG_ADMIN_USER" && ! "$ISPCONFIG_ADMIN_USER" =~ ^[A-Za-z0-9._-]+$ ]]; then
         __error "ISPCONFIG_ADMIN_USER may contain only letters, digits, dot, underscore and hyphen"
     fi
-    if [[ ! "$PANEL_HOSTNAME" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ \
-        || ${#PANEL_HOSTNAME} -gt 253 ]]; then
-        __error "ISPCONFIG_PANEL_HOSTNAME must be a valid fully-qualified DNS hostname"
+    if [[ -n "${ISPCONFIG_HOSTNAME:-}" ]] && ! __is_fqdn "$HOSTNAME"; then
+        __error "ISPCONFIG_HOSTNAME must be a valid fully-qualified DNS hostname"
+    fi
+    if ! __is_fqdn "$PANEL_HOSTNAME"; then
+        __error "Panel hostname '${PANEL_HOSTNAME}' is not a valid fully-qualified DNS hostname; set ISPCONFIG_PANEL_HOSTNAME"
     fi
     if [[ -n "${ISPCONFIG_PANEL_CERT:-}" && -z "${ISPCONFIG_PANEL_KEY:-}" \
         || -z "${ISPCONFIG_PANEL_CERT:-}" && -n "${ISPCONFIG_PANEL_KEY:-}" ]]; then
@@ -325,18 +337,54 @@ __generate_passwords() {
     fi
 }
 
-# ── Hostname ──────────────────────────────────────────────────────────────────
-__set_hostname() {
-    if [[ -z "$HOSTNAME" ]]; then
-        local sys_host domain
-        sys_host=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo 'server')
-        domain=$(hostname -d 2>/dev/null)
-        [[ -z "$domain" ]] && domain="local"
-        HOSTNAME="${sys_host}.${domain}"
-    fi
-    # Ensure HOSTNAME includes a domain component
-    [[ "$HOSTNAME" != *.* ]] && HOSTNAME="${HOSTNAME}.local"
+# Strips surrounding dots and whitespace from a hostname or domain; "(none)"
+# (printed by hostname -d when unset) and a bare "." become empty.
+__clean_name() {
+    local v="${1//[[:space:]]/}"
+    while [[ "$v" == .* ]]; do v="${v#.}"; done
+    while [[ "$v" == *. ]]; do v="${v%.}"; done
+    [[ "$v" == "(none)" ]] && v=""
+    printf '%s' "${v,,}"
+}
 
+# ── Hostname ──────────────────────────────────────────────────────────────────
+# Detects the server FQDN, its domain and the panel hostname without changing
+# the system, so bad input is rejected before anything is installed. Each value
+# can be overridden: ISPCONFIG_HOSTNAME (server FQDN), ISPCONFIG_DOMAIN (domain
+# part) and ISPCONFIG_PANEL_HOSTNAME. The panel defaults to panel.<domain>, or
+# to the server FQDN when the domain is not a real, resolvable one.
+__detect_hostname() {
+    local short domain
+    domain=$(__clean_name "${ISPCONFIG_DOMAIN:-}")
+    if [[ -n "${ISPCONFIG_HOSTNAME:-}" ]]; then
+        HOSTNAME=$(__clean_name "$ISPCONFIG_HOSTNAME")
+    else
+        short=$(__clean_name "$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo server)")
+        short="${short%%.*}"
+        if [[ -z "$domain" ]]; then
+            domain=$(__clean_name "$(hostname -d 2>/dev/null || true)")
+        fi
+        if [[ -z "$domain" ]]; then
+            domain=$(__clean_name "$(awk '$1 == "search" || $1 == "domain" {print $2; exit}' /etc/resolv.conf 2>/dev/null)")
+        fi
+        HOSTNAME="${short:-server}.${domain:-local}"
+    fi
+    [[ "$HOSTNAME" == *.* ]] || HOSTNAME="${HOSTNAME}.${domain:-local}"
+
+    DOMAIN="${domain:-${HOSTNAME#*.}}"
+
+    if [[ -z "$PANEL_HOSTNAME" ]]; then
+        case "$DOMAIN" in
+            local|localdomain|localhost|internal|lan|home|home.arpa) PANEL_HOSTNAME="$HOSTNAME" ;;
+            *) PANEL_HOSTNAME="panel.${DOMAIN}" ;;
+        esac
+    fi
+    PANEL_HOSTNAME=$(__clean_name "$PANEL_HOSTNAME")
+    __log "Hostname ${HOSTNAME}, domain ${DOMAIN}, panel ${PANEL_HOSTNAME}"
+}
+
+# Applies the detected hostname to the system.
+__set_hostname() {
     local base_hostname="${HOSTNAME%%.*}"
 
     # Set static hostname (persists across reboots)
@@ -1306,7 +1354,9 @@ MPMEOF
                 && ! grep -q -- '^[[:space:]]*LoadModule[[:space:]]\+suexec_module' "$listen_file"; then
                 sed -i '/^LoadModule fcgid_module /a LoadModule suexec_module modules/mod_suexec.so' "$listen_file"
             fi
-            config_dirs=("${APACHE_CONF_DIR}/conf.d" "${APACHE_CONF_DIR}/conf/sites-available" "${APACHE_CONF_DIR}/conf/sites-enabled" "${APACHE_CONF_DIR}/conf/vhosts.d" "${APACHE_VHOST_DIR}")
+            config_dirs=("${APACHE_CONF_DIR}/conf.d" "${APACHE_CONF_DIR}/conf/sites-available"
+                         "${APACHE_CONF_DIR}/conf/sites-enabled" "${APACHE_CONF_DIR}/conf/vhosts.d"
+                         "${APACHE_VHOST_DIR}")
             ;;
     esac
 
@@ -1814,12 +1864,13 @@ __verify_services() {
     done
 
     if ((${#failed[@]} > 0)); then
-        __error "Service(s) not running after install: ${failed[*]}"
+        # Details first: __error exits, so nothing after it would ever print.
         for svc in "${failed[@]}"; do
+            [[ "$svc" == postfix-map:* ]] && continue
             __log "--- systemctl status ${svc} ---"
             systemctl status "$svc" --no-pager --lines=5 2>&1 | head -8 || true
         done
-        return 1
+        __error "Service(s) or checks failed after install: ${failed[*]}"
     fi
 
     # The panel must answer through its hostname vhost on Apache TLS.
@@ -1829,12 +1880,11 @@ __verify_services() {
     code="${code:-000}"
     case "$code" in
         200|30[0-9]) __log "ISPConfig panel responding (HTTP ${code})" ;;
-        *) __error "ISPConfig panel returned HTTP ${code} on https://${PANEL_HOSTNAME}/"; return 1 ;;
+        *) __error "ISPConfig panel returned HTTP ${code} on https://${PANEL_HOSTNAME}/" ;;
     esac
 
     if systemctl is-active --quiet nginx; then
         __error "Nginx is still active; Apache must be the only web listener"
-        return 1
     fi
 }
 
@@ -1968,11 +2018,20 @@ NOSITE_EOF
 <VirtualHost *:80>
     ServerName nosite.invalid
     DocumentRoot ${nosite_root}
+    # A base config may load mod_speling, which would answer unknown paths with a
+    # "corrected" 301 instead of a plain 404.
+    <IfModule mod_speling.c>
+        CheckSpelling Off
+    </IfModule>
     Alias /.well-known/acme-challenge/ ${LETSENCRYPT_WEBROOT}/.well-known/acme-challenge/
     <Directory ${LETSENCRYPT_WEBROOT}/.well-known/acme-challenge/>
         Require all granted
         Options None
         AllowOverride None
+        # A base config may set ErrorDocument paths; those become internal
+        # requests that the HTTPS redirect below would turn into a 301.
+        ErrorDocument 403 default
+        ErrorDocument 404 default
     </Directory>
     RewriteEngine On
     RewriteCond %{REQUEST_URI} !^/.well-known/acme-challenge/
@@ -1983,6 +2042,9 @@ NOSITE_EOF
 <VirtualHost *:443>
     ServerName nosite.invalid
     DocumentRoot ${nosite_root}
+    <IfModule mod_speling.c>
+        CheckSpelling Off
+    </IfModule>
     SSLEngine on
     SSLCertificateFile ${SSL_DIR}/default.crt
     SSLCertificateKeyFile ${SSL_DIR}/default.key
@@ -2006,8 +2068,10 @@ NOSITE_VHOST_EOF
             if [[ -f "$main_config" ]]; then
                 sed -i "\|^[[:space:]]*IncludeOptional ${include_path}[[:space:]]*$|d" "$main_config"
                 local first_vhost first_vhost_include
-                first_vhost_include=$(grep -n -m1 -E '^[[:space:]]*Include(Optional)?[[:space:]].*(conf\.d/|vhosts\.d/|sites-enabled/)' "$main_config" | cut -d: -f1)
-                first_vhost=$(grep -n -m1 -E '^[[:space:]]*<VirtualHost([[:space:]]|>)' "$main_config" | cut -d: -f1)
+                first_vhost_include=$(grep -n -m1 -E -- '^[[:space:]]*Include(Optional)?[[:space:]].*(conf\.d/|vhosts\.d/|sites-enabled/)' "$main_config" || true)
+                first_vhost_include="${first_vhost_include%%:*}"
+                first_vhost=$(grep -n -m1 -i -E -- '^[[:space:]]*<VirtualHost([[:space:]]|>)' "$main_config" || true)
+                first_vhost="${first_vhost%%:*}"
                 if [[ -n "$first_vhost_include" && ( -z "$first_vhost" || "$first_vhost_include" -lt "$first_vhost" ) ]]; then
                     first_vhost="$first_vhost_include"
                 fi
@@ -2158,6 +2222,7 @@ __main() {
     __check_existing_install
     __check_session_safety
     __detect_distro
+    __detect_hostname
     __generate_passwords
     __set_hostname
 
