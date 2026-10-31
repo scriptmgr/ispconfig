@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202610311356-git
+##@Version           :  202610311533-git
 # @@Author           :  ISPConfig Universal Installer Contributors
 # @@Contact          :  https://github.com/scriptmgr/ispconfig
 # @@License          :  MIT
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202610311356-git"
+VERSION="202610311533-git"
 
 # Universal ISPConfig Installation Script
 # Architecture: Apache direct listeners on :80/:443; ISPConfig panel on configured hostname
@@ -299,6 +299,14 @@ __validate_credential() {
     fi
 }
 
+# 32 random alphanumeric characters from the kernel CSPRNG; needs no package,
+# so it works before openssl is installed and never emits a rejected character.
+__random_secret() {
+    local secret
+    secret=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32 || true)
+    printf '%s' "$secret"
+}
+
 __generate_passwords() {
     __validate_credential ISPCONFIG_MYSQL_ROOT_PASSWORD "$ISPCONFIG_MYSQL_ROOT_PASSWORD"
     __validate_credential ISPCONFIG_ADMIN_PASSWORD "$ISPCONFIG_ADMIN_PASSWORD"
@@ -320,11 +328,11 @@ __generate_passwords() {
         __error "ISPCONFIG_PANEL_CERT and ISPCONFIG_PANEL_KEY must be absolute paths without whitespace"
     fi
     if [[ -z "$ISPCONFIG_MYSQL_ROOT_PASSWORD" ]]; then
-        ISPCONFIG_MYSQL_ROOT_PASSWORD=$(openssl rand -base64 32)
+        ISPCONFIG_MYSQL_ROOT_PASSWORD=$(__random_secret)
         __log "Generated MySQL root password"
     fi
     if [[ -z "$ISPCONFIG_ADMIN_PASSWORD" ]]; then
-        ISPCONFIG_ADMIN_PASSWORD=$(openssl rand -base64 32)
+        ISPCONFIG_ADMIN_PASSWORD=$(__random_secret)
         __log "Generated ISPConfig admin password"
     fi
     # Not a secret to generate — ISPConfig's own autoinstall.ini has no key for
@@ -332,7 +340,7 @@ __generate_passwords() {
     # here just preserves that behavior when the caller doesn't override it.
     ISPCONFIG_ADMIN_USER="${ISPCONFIG_ADMIN_USER:-admin}"
     if [[ -z "$ISPCONFIG_DB_PASSWORD" ]]; then
-        ISPCONFIG_DB_PASSWORD=$(openssl rand -base64 32)
+        ISPCONFIG_DB_PASSWORD=$(__random_secret)
         __log "Generated ISPConfig DB user password"
     fi
 }
@@ -441,13 +449,13 @@ __install_base_packages() {
     __log "Installing base packages..."
     case "$PACKAGE_MANAGER" in
         "apt")
-            apt-get install -y wget curl vim net-tools dnsutils openssl ssl-cert
+            apt-get install -y wget curl vim net-tools dnsutils openssl ssl-cert tar gzip
             ;;
         "dnf"|"yum")
-            $PACKAGE_MANAGER install -y wget curl vim net-tools bind-utils openssl
+            $PACKAGE_MANAGER install -y wget curl vim net-tools bind-utils openssl tar gzip
             ;;
         "zypper")
-            zypper install -y wget curl vim net-tools bind-utils openssl
+            zypper install -y wget curl vim net-tools bind-utils openssl tar gzip
             ;;
     esac
 }
@@ -563,6 +571,19 @@ __prepare_mariadb() {
         | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]+$//; s/^"(.*)"$/\1/')
 }
 
+# RHEL-family and SUSE MariaDB packages listen on every interface by default.
+# ISPConfig runs single-server here and connects over 127.0.0.1, so the
+# database must never be reachable from the network.
+__bind_mariadb_loopback() {
+    local confdir
+    for confdir in /etc/my.cnf.d /etc/mysql/mariadb.conf.d; do
+        [[ -d "$confdir" ]] || continue
+        printf '[mysqld]\nbind-address = 127.0.0.1\n' > "${confdir}/99-ispconfig-bind.cnf"
+        return 0
+    done
+    __warn "No MariaDB config directory found — cannot restrict MariaDB to 127.0.0.1"
+}
+
 __install_mysql() {
     __log "Installing MariaDB server..."
     case "$PACKAGE_MANAGER" in
@@ -572,6 +593,7 @@ __install_mysql() {
     esac
 
     __prepare_mariadb
+    __bind_mariadb_loopback
     systemctl enable mariadb
     systemctl start mariadb
 
@@ -1118,6 +1140,8 @@ __install_tools() {
             ;;
     esac
 
+    __amavis_install_deps
+
     # Package scripts may start BIND without enabling it for the next boot.
     systemctl enable --now named
 }
@@ -1184,11 +1208,10 @@ maxretry = 5
 filter   = ispconfig-panel
 EOF
 
-    # Custom filter for ISPConfig panel login failures
+    # Custom filter for ISPConfig panel login failures; fail2ban strips the timestamp before matching
     cat > /etc/fail2ban/filter.d/ispconfig-panel.conf << 'FILTER_EOF'
 [Definition]
-failregex = ^.*\[client <HOST>\].*authentication failure.*$
-            ^.*Login failed for.*from <HOST>.*$
+failregex = ^Failed login for user .* from <HOST> at(?:\s|$)
 ignoreregex =
 FILTER_EOF
 
@@ -1206,6 +1229,7 @@ FILTER_EOF
 
 # ── ISPConfig install ─────────────────────────────────────────────────────────
 __install_ispconfig() {
+    __selinux_prepare
     __log "Downloading ISPConfig..."
     cd /tmp
     wget -O ispconfig.tar.gz https://www.ispconfig.org/downloads/ISPConfig-3-stable.tar.gz
@@ -1364,13 +1388,12 @@ MPMEOF
     esac
 
     [[ -e "${listen_file}.pre-ispconfig" ]] || cp -a "$listen_file" "${listen_file}.pre-ispconfig"
-    if grep -Eq -- '(:81|:8443)' "$listen_file"; then
-        [[ -e "${listen_file}.pre-ispconfig" ]] || cp -a "$listen_file" "${listen_file}.pre-ispconfig"
-        sed -i \
-            -e 's|:81>|:80>|g' \
-            -e 's|:8443>|:443>|g' \
-            -e '/^[[:space:]]*NameVirtualHost/d' "$listen_file"
-    fi
+    # ISPConfig appends NameVirtualHost lines to the main config; Apache 2.4
+    # ignores them and warns AH00548 on every configtest.
+    sed -i \
+        -e 's|:81>|:80>|g' \
+        -e 's|:8443>|:443>|g' \
+        -e '/^[[:space:]]*NameVirtualHost/d' "$listen_file"
 
     local ispc_admin_vhost="${APACHE_CONF_DIR}/conf/sites-available/ispconfig.vhost"
     local ispc_apps_vhost="${APACHE_CONF_DIR}/conf/sites-available/apps.vhost"
@@ -1397,7 +1420,6 @@ MPMEOF
         done < <(find "$vhost_dir" -maxdepth 1 -type f \( -name '*.conf' -o -name '*.vhost' \) -print0 2>/dev/null)
     done
 
-    [[ -e "${listen_file}.pre-ispconfig" ]] || cp -a "$listen_file" "${listen_file}.pre-ispconfig"
     sed -i '/^[[:space:]]*Listen[[:space:]]/d' "$listen_file"
     cat >> "$listen_file" <<LISTENEOF
 
@@ -1473,6 +1495,36 @@ MPMTUNEEOF
     __log "Apache listens directly on :80 and :443; ISPConfig panel remains on :${APACHE_ADMIN_PORT} internally"
 }
 
+# Labels the given TCP ports http_port_t so httpd may bind them. ISPConfig
+# restarts Apache on its own listeners while it installs; without the label
+# that restart fails with "could not bind to address" on 8081.
+__selinux_label_ports() {
+    local p
+    for p in "$@"; do
+        [[ "$p" =~ ^[0-9]+$ ]] || continue
+        semanage port -d -t transproxy_port_t -p tcp "$p" 2>/dev/null || true
+        semanage port -d -t unreserved_port_t -p tcp "$p" 2>/dev/null || true
+        semanage port -a -t http_port_t -p tcp "$p" 2>/dev/null \
+            || semanage port -m -t http_port_t -p tcp "$p" 2>/dev/null || true
+    done
+}
+
+# Runs before the ISPConfig installer on enforcing SELinux hosts, so its own
+# Apache restarts can bind the panel (7080) and apps (8081) ports.
+__selinux_prepare() {
+    command -v semanage >/dev/null 2>&1 || return 0
+    [[ "$(getenforce 2>/dev/null)" == "Disabled" ]] && return 0
+    __selinux_label_ports "$APACHE_ADMIN_PORT" 8081
+
+    # ISPConfig creates the mailman maps Postfix reads under /var/lib/mailman;
+    # files inherit their directory's type, so label it before they exist or
+    # postalias is denied while ISPConfig installs.
+    semanage fcontext -a -t postfix_etc_t "/var/lib/mailman(/data(/.*)?)?" 2>/dev/null \
+        || semanage fcontext -m -t postfix_etc_t "/var/lib/mailman(/data(/.*)?)?" 2>/dev/null || true
+    mkdir -p /var/lib/mailman/data
+    restorecon -R /var/lib/mailman 2>/dev/null || true
+}
+
 # ── SELinux labels (RHEL-family) ─────────────────────────────────────────────
 # Everything ISPConfig creates is born unconfined_u:usr_t / httpd_sys_content_t,
 # which httpd_t and httpd_suexec_t may not read or write. Preserve the labels
@@ -1494,14 +1546,7 @@ __configure_selinux() {
     setsebool -P httpd_enable_homedirs on 2>/dev/null || true
 
     # ISPConfig's internal panel and apps listeners need the Apache port type.
-    local p
-    for p in "$APACHE_ADMIN_PORT" "$APACHE_APPS_PORT"; do
-        [[ "$p" =~ ^[0-9]+$ ]] || continue
-        semanage port -d -t transproxy_port_t -p tcp "$p" 2>/dev/null || true
-        semanage port -d -t unreserved_port_t -p tcp "$p" 2>/dev/null || true
-        semanage port -a -t http_port_t -p tcp "$p" 2>/dev/null \
-            || semanage port -m -t http_port_t -p tcp "$p" 2>/dev/null || true
-    done
+    __selinux_label_ports "$APACHE_ADMIN_PORT" "$APACHE_APPS_PORT"
 
     # 3. ISPConfig's own tree is written at runtime by httpd_t/suexec (sessions,
     #    IDS storage, cache) — label it read-write instead of the default usr_t.
@@ -1535,6 +1580,11 @@ __configure_selinux() {
     #    CAP_DAC_OVERRIDE — it cannot create anything under a directory it does
     #    not own. Own the tree by root and give the Apache group read access;
     #    setgid keeps new files group-readable for Apache.
+    # vlogger runs as httpd_sys_script_t, which may not create directories under
+    # var_log_t; httpd_sys_rw_content_t lets it (and httpd_t) write per-vhost logs.
+    semanage fcontext -a -t httpd_sys_rw_content_t "/var/log/ispconfig/httpd(/.*)?" 2>/dev/null \
+        || semanage fcontext -m -t httpd_sys_rw_content_t "/var/log/ispconfig/httpd(/.*)?" 2>/dev/null \
+        || true
     mkdir -p /var/log/ispconfig/httpd
     chown -R root:apache /var/log/ispconfig/httpd
     chmod 2775 /var/log/ispconfig/httpd
@@ -1575,7 +1625,7 @@ __configure_selinux() {
         __log "Disabled OPcache for CGI (${_ini})"
     done
 
-    restorecon -R /usr/local/ispconfig /var/log/ispconfig /var/www/php-fcgi-scripts /var/lib/mailman "$LETSENCRYPT_WEBROOT" 2>/dev/null || true
+    restorecon -R /usr/local/ispconfig /var/log/ispconfig /var/log/ispconfig/httpd /var/www/php-fcgi-scripts /var/lib/mailman "$LETSENCRYPT_WEBROOT" 2>/dev/null || true
 
     __success "SELinux policy applied (ports, booleans, file contexts)"
 }
@@ -1588,6 +1638,22 @@ __configure_ispconfig_apache() {
     cat > "$ssl_conf" <<'SSLEOF'
 SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1
 SSLEOF
+
+    # The panel backend sees every request as coming from 127.0.0.1 (the proxy
+    # hop), so its auth.log and the fail2ban jail would only ever record the
+    # loopback address. Trust X-Forwarded-For from loopback only; remote clients
+    # cannot spoof it because they never connect from 127.0.0.1.
+    local remoteip_conf="${APACHE_CONF_EXTRA}/ispconfig-remoteip.conf"
+    cat > "$remoteip_conf" <<'REMOTEIPEOF'
+<IfModule remoteip_module>
+    RemoteIPHeader X-Forwarded-For
+    RemoteIPInternalProxy 127.0.0.1
+</IfModule>
+REMOTEIPEOF
+    case "$PACKAGE_MANAGER" in
+        apt)    a2enmod remoteip; a2enconf ispconfig-remoteip ;;
+        zypper) a2enmod remoteip ;;
+    esac
 
     case "$PACKAGE_MANAGER" in
         apt)
@@ -1661,7 +1727,7 @@ __configure_ssl() {
             -keyout "${SSL_DIR}/default.key" -out "${SSL_DIR}/default.crt" \
             -subj "/C=US/ST=./L=./O=Default/CN=${HOSTNAME}"
     fi
-    chmod 640 "${SSL_DIR}"/*.key 2>/dev/null || true
+    chmod 600 "${SSL_DIR}"/*.key 2>/dev/null || true
 
     mkdir -p /etc/letsencrypt/renewal-hooks/deploy
     cat > /etc/letsencrypt/renewal-hooks/deploy/99-ispconfig-apache-reload <<'HOOKEOF'
@@ -1695,12 +1761,12 @@ __amavis_detect() {
     fi
 }
 
-__fixup_amavisd() {
-    # amavisd is optional; nothing to do when the package is absent.
+# amavisd needs Perl modules its packages do not always pull in. Installing
+# them before ISPConfig runs keeps amavisd from failing every time ISPConfig's
+# own installer restarts it.
+__amavis_install_deps() {
     __amavis_detect
     [[ -n "$AMAVIS_CONF_DIR" ]] || return 0
-
-    __log "Repairing amavisd installation..."
 
     # 1. Missing Perl DBI driver. The amavis RPM does not pull perl-DBD-mysql in,
     #    and amavisd hard-exits with "MISSING REQUIRED ADDITIONAL MODULES"
@@ -1712,6 +1778,27 @@ __fixup_amavisd() {
         __try_install "$PACKAGE_MANAGER" $dbd_pkgs \
             || __warn "amavisd: perl DBD::mysql unavailable — amavisd will not start"
     fi
+
+    # 1b. Net::Server resolves the ::1 listener ISPConfig configures through
+    #     IO::Socket::INET6/Socket6, which EL10 does not install with amavisd;
+    #     without them amavisd dies at startup with "Unresolveable host [::1]".
+    if ! perl -MSocket6 -MIO::Socket::INET6 -e1 2>/dev/null; then
+        local inet6_pkgs="perl-Socket6 perl-IO-Socket-INET6"
+        [[ "$PACKAGE_MANAGER" == "apt" ]] && inet6_pkgs="libsocket6-perl libio-socket-inet6-perl"
+        # shellcheck disable=SC2086
+        __try_install "$PACKAGE_MANAGER" $inet6_pkgs \
+            || __warn "amavisd: perl IPv6 socket modules unavailable — amavisd may not start"
+    fi
+}
+
+__fixup_amavisd() {
+    # amavisd is optional; nothing to do when the package is absent.
+    __amavis_detect
+    [[ -n "$AMAVIS_CONF_DIR" ]] || return 0
+
+    __log "Repairing amavisd installation..."
+
+    __amavis_install_deps
 
     # 2. ISPConfig's installer_base.lib.php chmods amavisd.conf and 60-dkim to
     #    0640 but leaves the group as root. amavisd drops to $daemon_user
@@ -2194,7 +2281,7 @@ Let's Encrypt:
 Important files:
   /usr/local/ispconfig/          ISPConfig root
   ${APACHE_CONF_DIR}/            Apache configuration
-  ${APACHE_CONF_EXTRA}/ispconfig-panel.conf  Panel hostname vhost
+  ${APACHE_VHOST_DIR}/10-ispconfig-panel.conf  Panel hostname vhost
   /etc/postfix/main.cf           Postfix config
   /etc/dovecot/conf.d/           Dovecot config
   /etc/opendkim.conf             OpenDKIM config
