@@ -13,11 +13,3 @@ sysadmin's / ISPConfig's job, not a defect.
 - Not tested: openSUSE, Fedora, CentOS/RHEL 7-8, Ubuntu 18/20, Debian 9-11.
 - Not tested: ISPConfig's own Let's Encrypt (acme.sh) certificates against the
   Apache-direct layout.
-
-## Conventions
-
-- The hostname fallback when no domain can be detected is `.local`
-  (`__detect_hostname`). `networking_conventions.md` says private names use
-  `.internal`, because `.local` is reserved for mDNS. Changing it alters the
-  default FQDN written to the summary, `/etc/hosts` and mail config, so decide
-  before changing it.

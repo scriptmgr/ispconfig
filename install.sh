@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202610311334-git
+##@Version           :  202610311356-git
 # @@Author           :  ISPConfig Universal Installer Contributors
 # @@Contact          :  https://github.com/scriptmgr/ispconfig
 # @@License          :  MIT
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202610311334-git"
+VERSION="202610311356-git"
 
 # Universal ISPConfig Installation Script
 # Architecture: Apache direct listeners on :80/:443; ISPConfig panel on configured hostname
@@ -367,9 +367,12 @@ __detect_hostname() {
         if [[ -z "$domain" ]]; then
             domain=$(__clean_name "$(awk '$1 == "search" || $1 == "domain" {print $2; exit}' /etc/resolv.conf 2>/dev/null)")
         fi
-        HOSTNAME="${short:-server}.${domain:-local}"
+        # .local is reserved for mDNS and .localdomain is a legacy default, so a
+        # detected domain of either means "no real domain"; fall back to .internal.
+        case "$domain" in local|localdomain) domain="" ;; esac
+        HOSTNAME="${short:-server}.${domain:-internal}"
     fi
-    [[ "$HOSTNAME" == *.* ]] || HOSTNAME="${HOSTNAME}.${domain:-local}"
+    [[ "$HOSTNAME" == *.* ]] || HOSTNAME="${HOSTNAME}.${domain:-internal}"
 
     DOMAIN="${domain:-${HOSTNAME#*.}}"
 
