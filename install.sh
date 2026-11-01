@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202610311533-git
+##@Version           :  202611011005-git
 # @@Author           :  ISPConfig Universal Installer Contributors
 # @@Contact          :  https://github.com/scriptmgr/ispconfig
 # @@License          :  MIT
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202610311533-git"
+VERSION="202611011005-git"
 
 # Universal ISPConfig Installation Script
 # Architecture: Apache direct listeners on :80/:443; ISPConfig panel on configured hostname
@@ -49,6 +49,7 @@ export APT_LISTCHANGES_FRONTEND=none
 # runtime (PHP_DEFAULT, Apache ports) are written here with __save_var and
 # re-read by __step after the phase succeeds.
 STATE_FILE=""
+APT_NOPROMPT_CONF="/etc/apt/apt.conf.d/99ispconfig-noprompt"
 NOSITE_PHPINFO=0
 
 ADMIN_PORT=443
@@ -413,12 +414,29 @@ __set_hostname() {
     __log "Hostname configured: ${HOSTNAME}"
 }
 
+# A config tree copied onto the host can leave /etc and its contents with the
+# wrong SELinux type (for example /etc as usr_t). Package scriptlets such as
+# groupadd then fail with "cannot lock /etc/group" and abort package installs.
+# Restoring the policy defaults under /etc fixes that and is a no-op otherwise.
+__selinux_relabel_etc() {
+    command -v restorecon >/dev/null 2>&1 || return 0
+    [[ "$(getenforce 2>/dev/null)" == "Disabled" || -z "$(getenforce 2>/dev/null)" ]] && return 0
+    local changed
+    changed=$(restorecon -Rv /etc 2>/dev/null | wc -l)
+    ((changed > 0)) && __warn "Restored default SELinux labels on ${changed} item(s) under /etc"
+    return 0
+}
+
 # ── System update ─────────────────────────────────────────────────────────────
 __update_system() {
     __log "Updating system packages..."
     case "$PACKAGE_MANAGER" in
         "apt")
             export DEBIAN_FRONTEND=noninteractive
+            # Keep existing config files when a package ships its own (for example
+            # a pre-seeded /etc/letsencrypt/cli.ini); dpkg would otherwise prompt
+            # and abort the install without a terminal. Removed again by __main.
+            printf 'Dpkg::Options {\n  "--force-confdef";\n  "--force-confold";\n};\n' > "$APT_NOPROMPT_CONF"
             # A previous upgrade or reboot can leave packages unpacked but not
             # configured; apt refuses to do anything until that is finished.
             dpkg --configure -a
@@ -474,6 +492,27 @@ __disable_nginx() {
 }
 
 # ── Apache install ────────────────────────────────────────────────────────────
+# A LoadModule line whose .so does not exist can never work and stops Apache
+# from starting at all. Leftover module configs from packages that were removed
+# (or from config trees copied onto a host) cause exactly that, so comment such
+# lines out before the first start. Backups keep the original as *.pre-ispconfig.
+__disable_dangling_modules() {
+    local conf line num rel so
+    for conf in "${APACHE_CONF_DIR}"/conf.modules.d/*.conf "${APACHE_CONF_DIR}"/conf.d/*.conf "${APACHE_CONF_DIR}"/conf/httpd.conf; do
+        [[ -f "$conf" ]] || continue
+        while IFS=: read -r num line; do
+            rel=$(awk '{print $3}' <<< "$line")
+            [[ -n "$rel" ]] || continue
+            so="$rel"
+            [[ "$so" == /* ]] || so="${APACHE_CONF_DIR}/${rel}"
+            [[ -e "$so" ]] && continue
+            [[ -e "${conf}.pre-ispconfig" ]] || cp -a "$conf" "${conf}.pre-ispconfig"
+            sed -i "${num}s|^|# disabled by the ISPConfig installer (module file missing): |" "$conf"
+            __warn "Disabled LoadModule for missing ${so} in ${conf}"
+        done < <(grep -nE -- '^[[:space:]]*LoadModule[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+' "$conf")
+    done
+}
+
 __install_apache() {
     __log "Installing Apache web server..."
     case "$PACKAGE_MANAGER" in
@@ -485,6 +524,7 @@ __install_apache() {
             ;;
         "dnf"|"yum")
             $PACKAGE_MANAGER install -y httpd mod_ssl mod_fcgid
+            __disable_dangling_modules
             systemctl enable httpd
             systemctl start httpd
             ;;
@@ -710,17 +750,23 @@ __install_php_debian() {
             continue
         fi
 
-        # Install extension packages one at a time, skipping any that are missing.
-        # Some extensions (opcache, imap, gettext, exif, sockets) are built directly
-        # into the PHP binary from certain versions onward and have no separate package.
+        # Install the extension packages in one apt run (each run fires slow
+        # Apache/PHP triggers), skipping any that are missing. Some extensions
+        # (opcache, imap, gettext, exif, sockets) are built into the PHP binary
+        # from certain versions onward and have no separate package. If the
+        # batch fails, fall back to one package at a time.
+        local ext_pkgs=() pkg
         for ext in mysql pgsql sqlite3 gd imagick mbstring xml curl zip soap intl \
                    bcmath opcache readline bz2 xsl tidy ldap imap gettext exif sockets \
                    redis memcached; do
-            local pkg="php${version}-${ext}"
-            if apt-cache show "$pkg" >/dev/null 2>&1; then
-                apt-get install -y "$pkg" 2>/dev/null || true
-            fi
+            pkg="php${version}-${ext}"
+            apt-cache show "$pkg" >/dev/null 2>&1 && ext_pkgs+=("$pkg")
         done
+        if ! apt-get install -y "${ext_pkgs[@]}" 2>/dev/null; then
+            for pkg in "${ext_pkgs[@]}"; do
+                apt-get install -y "$pkg" 2>/dev/null || true
+            done
+        fi
 
         # json is a separate package on PHP < 8.0 (built-in from 8.0 onward)
         if dpkg --compare-versions "${version}" lt "8.0" 2>/dev/null; then
@@ -1119,24 +1165,37 @@ __install_tools() {
     case "$PACKAGE_MANAGER" in
         "apt")
             # Core tools
-            apt-get install -y bind9 bind9utils rsync cron
+            # amavisd-new is required: ISPConfig points Postfix's content_filter at it,
+            # so without it every message defers with "Connection refused".
+            apt-get install -y bind9 bind9utils rsync cron amavisd-new
             # quota requires kernel quota support — unavailable in most containers
             __try_install apt quota
             # certbot may be absent from trixie main (available via snap/pip)
             __try_install apt certbot
             # Optional / may be absent in newer distros
-            __try_install apt awstats webalizer clamav clamav-daemon amavisd-new spamassassin
+            __try_install apt awstats webalizer clamav clamav-daemon spamassassin
             ;;
         "dnf"|"yum")
             $PACKAGE_MANAGER install -y bind bind-utils rsync crontabs
+            # amavisd-new is required (see the apt branch). Its optional dependencies
+            # (for example 7zip) can be unavailable on a mirror; retry without them.
+            $PACKAGE_MANAGER install -y amavisd-new || {
+                __warn "amavisd-new install failed; retrying without weak dependencies"
+                $PACKAGE_MANAGER install -y --setopt=install_weak_deps=False amavisd-new
+            }
             # RHEL named.conf includes named.conf.local which must exist before start
             touch /etc/named.conf.local
             __try_install "$PACKAGE_MANAGER" quota certbot
-            __try_install "$PACKAGE_MANAGER" awstats webalizer clamav clamav-update amavisd-new spamassassin
+            __try_install "$PACKAGE_MANAGER" awstats webalizer clamav clamav-update spamassassin
+            # clamd refuses to start with an empty database, and amavisd then reports
+            # "ALL VIRUS SCANNERS FAILED" for every message; fetch the signatures now.
+            if command -v freshclam >/dev/null 2>&1; then
+                freshclam --quiet || __warn "freshclam could not download the ClamAV database — virus scanning stays off until it succeeds"
+            fi
             ;;
         "zypper")
-            zypper install -y bind bind-utils rsync cron
-            __try_install zypper quota awstats webalizer clamav amavisd-new spamassassin
+            zypper install -y bind bind-utils rsync cron amavisd-new
+            __try_install zypper quota awstats webalizer clamav spamassassin
             ;;
     esac
 
@@ -1333,6 +1392,62 @@ EOF
         "$grant_bin" -u root -p"${ISPCONFIG_MYSQL_ROOT_PASSWORD}" -e "$grant_sql"
     done
     __log "Granted the ispconfig DB user access from localhost and 127.0.0.1"
+
+    __configure_ispconfig_php_remi
+    __configure_ispconfig_php_debian
+}
+
+# ── ISPConfig PHP-FPM wiring for Remi PHP (RHEL-family) ──────────────────────
+# ISPConfig's RHEL defaults expect the distro php-fpm (/etc/php-fpm.d, the
+# php-fpm service, /etc/php.ini). Remi's versioned packages live elsewhere, so
+# without this every PHP-FPM website fails to get its pool. Point the server
+# defaults at the highest installed Remi version and register every Remi
+# version as an additional PHP version selectable per website.
+__configure_ispconfig_php_remi() {
+    [[ "$PACKAGE_MANAGER" == "dnf" || "$PACKAGE_MANAGER" == "yum" ]] || return 0
+    local dvc="${PHP_DEFAULT//./}"
+    [[ -d "/etc/opt/remi/php${dvc}/php-fpm.d" ]] || { __warn "Remi php${dvc}-php-fpm not found — skipping ISPConfig PHP-FPM wiring"; return 0; }
+
+    local mysql_bin="mysql"
+    command -v mariadb >/dev/null 2>&1 && mysql_bin="mariadb"
+    local sql="UPDATE server SET config = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(config,"
+    sql+=" 'php_fpm_init_script=php-fpm','php_fpm_init_script=php${dvc}-php-fpm'),"
+    sql+=" 'php_fpm_ini_path=/etc/php.ini','php_fpm_ini_path=/etc/opt/remi/php${dvc}/php.ini'),"
+    sql+=" 'php_fpm_pool_dir=/etc/php-fpm.d','php_fpm_pool_dir=/etc/opt/remi/php${dvc}/php-fpm.d'),"
+    sql+=" 'php_fpm_socket_dir=/var/lib/php5-fpm','php_fpm_socket_dir=/var/opt/remi/php${dvc}/run/php-fpm'),"
+    sql+=" 'php_ini_path_apache=/etc/php.ini','php_ini_path_apache=/etc/opt/remi/php${dvc}/php.ini');"
+
+    local version vc
+    for version in "${PHP_VERSIONS[@]}"; do
+        vc="${version//./}"
+        [[ -x "/opt/remi/php${vc}/root/usr/bin/php" ]] || continue
+        sql+=" INSERT INTO server_php (sys_userid,sys_groupid,sys_perm_user,sys_perm_group,sys_perm_other,server_id,client_id,name,"
+        sql+="php_fastcgi_binary,php_fastcgi_ini_dir,php_fpm_init_script,php_fpm_ini_dir,php_fpm_pool_dir,php_fpm_socket_dir,php_cli_binary,php_jk_section,active,sortprio)"
+        sql+=" SELECT 1,1,'riud','riud','',server_id,0,'PHP ${version}','/opt/remi/php${vc}/root/usr/bin/php-cgi','/etc/opt/remi/php${vc}/',"
+        sql+="'php${vc}-php-fpm','/etc/opt/remi/php${vc}/','/etc/opt/remi/php${vc}/php-fpm.d','/var/opt/remi/php${vc}/run/php-fpm',"
+        sql+="'/opt/remi/php${vc}/root/usr/bin/php','','y',100 FROM server LIMIT 1;"
+    done
+    "$mysql_bin" -u root -p"${ISPCONFIG_MYSQL_ROOT_PASSWORD}" dbispconfig -e "$sql"
+    __log "ISPConfig PHP-FPM defaults set to Remi PHP ${PHP_DEFAULT}; all installed Remi versions registered"
+}
+
+# ── ISPConfig additional PHP versions (Debian/Ubuntu) ────────────────────────
+# Registers every installed PHP-FPM version so each website can pick one in the
+# panel; the distro/PPA default keeps working through ISPConfig's own detection.
+__configure_ispconfig_php_debian() {
+    [[ "$PACKAGE_MANAGER" == "apt" ]] || return 0
+    local mysql_bin="mysql" sql="" version
+    command -v mariadb >/dev/null 2>&1 && mysql_bin="mariadb"
+    for version in "${PHP_VERSIONS[@]}"; do
+        [[ -d "/etc/php/${version}/fpm/pool.d" && -x "/usr/bin/php-cgi${version}" ]] || continue
+        sql+=" INSERT INTO server_php (sys_userid,sys_groupid,sys_perm_user,sys_perm_group,sys_perm_other,server_id,client_id,name,"
+        sql+="php_fastcgi_binary,php_fastcgi_ini_dir,php_fpm_init_script,php_fpm_ini_dir,php_fpm_pool_dir,php_fpm_socket_dir,php_cli_binary,php_jk_section,active,sortprio)"
+        sql+=" SELECT 1,1,'riud','riud','',server_id,0,'PHP ${version}','/usr/bin/php-cgi${version}','/etc/php/${version}/cgi/',"
+        sql+="'php${version}-fpm','/etc/php/${version}/fpm/','/etc/php/${version}/fpm/pool.d','/run/php','/usr/bin/php${version}','','y',100 FROM server LIMIT 1;"
+    done
+    [[ -n "$sql" ]] || return 0
+    "$mysql_bin" -u root -p"${ISPCONFIG_MYSQL_ROOT_PASSWORD}" dbispconfig -e "$sql"
+    __log "Registered installed PHP versions with ISPConfig"
 }
 
 # ── Apache direct-listener configuration ─────────────────────────────────────
@@ -1345,14 +1460,16 @@ __configure_apache_backend() {
         apt)
             listen_file="${APACHE_CONF_DIR}/ports.conf"
             a2dismod mpm_prefork mpm_worker remoteip 2>/dev/null || true
-            a2enmod mpm_event ssl rewrite headers proxy proxy_http
+            # proxy_fcgi hands .php requests to the per-site PHP-FPM pool; without it
+            # ISPConfig's PHP-FPM vhosts silently serve PHP source as plain text.
+            a2enmod mpm_event ssl rewrite headers proxy proxy_http proxy_fcgi setenvif
             a2enmod suexec 2>/dev/null || true
             config_dirs=("${APACHE_CONF_DIR}/sites-available" "${APACHE_CONF_DIR}/sites-enabled" "${APACHE_CONF_DIR}/conf-available")
             ;;
         zypper)
             listen_file="${APACHE_CONF_DIR}/httpd.conf"
             a2dismod mpm_prefork mpm_worker remoteip 2>/dev/null || true
-            a2enmod mpm_event ssl rewrite headers proxy proxy_http
+            a2enmod mpm_event ssl rewrite headers proxy proxy_http proxy_fcgi setenvif
             a2enmod suexec 2>/dev/null || true
             config_dirs=("${APACHE_CONF_DIR}" "${APACHE_VHOST_DIR}" "${APACHE_CONF_EXTRA}")
             ;;
@@ -1502,10 +1619,10 @@ __selinux_label_ports() {
     local p
     for p in "$@"; do
         [[ "$p" =~ ^[0-9]+$ ]] || continue
-        semanage port -d -t transproxy_port_t -p tcp "$p" 2>/dev/null || true
-        semanage port -d -t unreserved_port_t -p tcp "$p" 2>/dev/null || true
-        semanage port -a -t http_port_t -p tcp "$p" 2>/dev/null \
-            || semanage port -m -t http_port_t -p tcp "$p" 2>/dev/null || true
+        semanage port -d -t transproxy_port_t -p tcp "$p" >/dev/null 2>&1 || true
+        semanage port -d -t unreserved_port_t -p tcp "$p" >/dev/null 2>&1 || true
+        semanage port -a -t http_port_t -p tcp "$p" >/dev/null 2>&1 \
+            || semanage port -m -t http_port_t -p tcp "$p" >/dev/null 2>&1 || true
     done
 }
 
@@ -1519,10 +1636,17 @@ __selinux_prepare() {
     # ISPConfig creates the mailman maps Postfix reads under /var/lib/mailman;
     # files inherit their directory's type, so label it before they exist or
     # postalias is denied while ISPConfig installs.
-    semanage fcontext -a -t postfix_etc_t "/var/lib/mailman(/data(/.*)?)?" 2>/dev/null \
-        || semanage fcontext -m -t postfix_etc_t "/var/lib/mailman(/data(/.*)?)?" 2>/dev/null || true
+    semanage fcontext -a -t postfix_etc_t "/var/lib/mailman(/data(/.*)?)?" >/dev/null 2>&1 \
+        || semanage fcontext -m -t postfix_etc_t "/var/lib/mailman(/data(/.*)?)?" >/dev/null 2>&1 || true
     mkdir -p /var/lib/mailman/data
     restorecon -R /var/lib/mailman 2>/dev/null || true
+
+    # Dovecot (LMTP/IMAP) writes the virtual mailboxes ISPConfig creates under
+    # /var/vmail; the default var_t type denies it, so mail never delivers.
+    semanage fcontext -a -t mail_spool_t "/var/vmail(/.*)?" >/dev/null 2>&1 \
+        || semanage fcontext -m -t mail_spool_t "/var/vmail(/.*)?" >/dev/null 2>&1 || true
+    mkdir -p /var/vmail
+    restorecon -R /var/vmail 2>/dev/null || true
 }
 
 # ── SELinux labels (RHEL-family) ─────────────────────────────────────────────
@@ -1542,25 +1666,31 @@ __configure_selinux() {
     __log "Applying SELinux policy for ISPConfig..."
 
     # Apache proxies the panel request to its local ISPConfig listener.
-    setsebool -P httpd_can_network_connect on
-    setsebool -P httpd_enable_homedirs on 2>/dev/null || true
+    setsebool -P httpd_can_network_connect on >/dev/null 2>&1
+    setsebool -P httpd_enable_homedirs on >/dev/null 2>&1 || true
 
     # ISPConfig's internal panel and apps listeners need the Apache port type.
     __selinux_label_ports "$APACHE_ADMIN_PORT" "$APACHE_APPS_PORT"
 
+    # ISPConfig gives each PHP-FPM website its own 127.0.0.1 pool port starting
+    # at 9010; php-fpm runs as httpd_t and may only bind http_port_t ports. Stop
+    # at 9089 so the range never overlaps 9090 (Cockpit / websm_port_t).
+    semanage port -a -t http_port_t -p tcp 9010-9089 >/dev/null 2>&1 \
+        || semanage port -m -t http_port_t -p tcp 9010-9089 >/dev/null 2>&1 || true
+
     # 3. ISPConfig's own tree is written at runtime by httpd_t/suexec (sessions,
     #    IDS storage, cache) — label it read-write instead of the default usr_t.
-    semanage fcontext -a -t httpd_sys_rw_content_t "/usr/local/ispconfig(/.*)?" 2>/dev/null \
-        || semanage fcontext -m -t httpd_sys_rw_content_t "/usr/local/ispconfig(/.*)?" 2>/dev/null \
+    semanage fcontext -a -t httpd_sys_rw_content_t "/usr/local/ispconfig(/.*)?" >/dev/null 2>&1 \
+        || semanage fcontext -m -t httpd_sys_rw_content_t "/usr/local/ispconfig(/.*)?" >/dev/null 2>&1 \
         || true
-    semanage fcontext -a -t var_log_t "/var/log/ispconfig(/.*)?" 2>/dev/null \
-        || semanage fcontext -m -t var_log_t "/var/log/ispconfig(/.*)?" 2>/dev/null \
+    semanage fcontext -a -t var_log_t "/var/log/ispconfig(/.*)?" >/dev/null 2>&1 \
+        || semanage fcontext -m -t var_log_t "/var/log/ispconfig(/.*)?" >/dev/null 2>&1 \
         || true
-    semanage fcontext -a -t httpd_log_t "/var/log/ispconfig/auth.log" 2>/dev/null \
-        || semanage fcontext -m -t httpd_log_t "/var/log/ispconfig/auth.log" 2>/dev/null \
+    semanage fcontext -a -t httpd_log_t "/var/log/ispconfig/auth.log" >/dev/null 2>&1 \
+        || semanage fcontext -m -t httpd_log_t "/var/log/ispconfig/auth.log" >/dev/null 2>&1 \
         || true
-    semanage fcontext -a -t httpd_sys_script_exec_t "/usr/local/ispconfig/server/scripts/vlogger" 2>/dev/null \
-        || semanage fcontext -m -t httpd_sys_script_exec_t "/usr/local/ispconfig/server/scripts/vlogger" 2>/dev/null \
+    semanage fcontext -a -t httpd_sys_script_exec_t "/usr/local/ispconfig/server/scripts/vlogger" >/dev/null 2>&1 \
+        || semanage fcontext -m -t httpd_sys_script_exec_t "/usr/local/ispconfig/server/scripts/vlogger" >/dev/null 2>&1 \
         || true
 
     # 4. The PHP-FCGI starters are executed by suexec, which requires
@@ -1570,8 +1700,8 @@ __configure_selinux() {
         [[ -f "$starter" ]] || continue
         chattr -i "$starter" 2>/dev/null || true
     done
-    semanage fcontext -a -t httpd_sys_script_exec_t "/var/www/php-fcgi-scripts(/.*)?" 2>/dev/null \
-        || semanage fcontext -m -t httpd_sys_script_exec_t "/var/www/php-fcgi-scripts(/.*)?" 2>/dev/null \
+    semanage fcontext -a -t httpd_sys_script_exec_t "/var/www/php-fcgi-scripts(/.*)?" >/dev/null 2>&1 \
+        || semanage fcontext -m -t httpd_sys_script_exec_t "/var/www/php-fcgi-scripts(/.*)?" >/dev/null 2>&1 \
         || true
 
     # 5. vlogger writes per-vhost log dirs under /var/log/ispconfig; without a
@@ -1582,8 +1712,8 @@ __configure_selinux() {
     #    setgid keeps new files group-readable for Apache.
     # vlogger runs as httpd_sys_script_t, which may not create directories under
     # var_log_t; httpd_sys_rw_content_t lets it (and httpd_t) write per-vhost logs.
-    semanage fcontext -a -t httpd_sys_rw_content_t "/var/log/ispconfig/httpd(/.*)?" 2>/dev/null \
-        || semanage fcontext -m -t httpd_sys_rw_content_t "/var/log/ispconfig/httpd(/.*)?" 2>/dev/null \
+    semanage fcontext -a -t httpd_sys_rw_content_t "/var/log/ispconfig/httpd(/.*)?" >/dev/null 2>&1 \
+        || semanage fcontext -m -t httpd_sys_rw_content_t "/var/log/ispconfig/httpd(/.*)?" >/dev/null 2>&1 \
         || true
     mkdir -p /var/log/ispconfig/httpd
     chown -R root:apache /var/log/ispconfig/httpd
@@ -1593,12 +1723,12 @@ __configure_selinux() {
 
     # 6. postfix's postalias reads /var/lib/aliases, created outside the package
     #    and so left as var_lib_t.
-    semanage fcontext -a -t postfix_etc_t "/var/lib/aliases(/.*)?" 2>/dev/null \
-        || semanage fcontext -m -t postfix_etc_t "/var/lib/aliases(/.*)?" 2>/dev/null || true
+    semanage fcontext -a -t postfix_etc_t "/var/lib/aliases(/.*)?" >/dev/null 2>&1 \
+        || semanage fcontext -m -t postfix_etc_t "/var/lib/aliases(/.*)?" >/dev/null 2>&1 || true
 
     # 6b. postfix reads the mailman maps ISPConfig creates here, and must traverse the directory.
-    semanage fcontext -a -t postfix_etc_t "/var/lib/mailman(/data(/.*)?)?" 2>/dev/null \
-        || semanage fcontext -m -t postfix_etc_t "/var/lib/mailman(/data(/.*)?)?" 2>/dev/null || true
+    semanage fcontext -a -t postfix_etc_t "/var/lib/mailman(/data(/.*)?)?" >/dev/null 2>&1 \
+        || semanage fcontext -m -t postfix_etc_t "/var/lib/mailman(/data(/.*)?)?" >/dev/null 2>&1 || true
 
     # 7. PHP's OPcache locks a memfd shared-memory segment. Under
     #    httpd_sys_script_t that memfd is typed tmpfs_t and the lock is denied,
@@ -1625,7 +1755,7 @@ __configure_selinux() {
         __log "Disabled OPcache for CGI (${_ini})"
     done
 
-    restorecon -R /usr/local/ispconfig /var/log/ispconfig /var/log/ispconfig/httpd /var/www/php-fcgi-scripts /var/lib/mailman "$LETSENCRYPT_WEBROOT" 2>/dev/null || true
+    restorecon -R /usr/local/ispconfig /var/log/ispconfig /var/log/ispconfig/httpd /var/www/php-fcgi-scripts /var/lib/mailman /var/vmail "$LETSENCRYPT_WEBROOT" 2>/dev/null || true
 
     __success "SELinux policy applied (ports, booleans, file contexts)"
 }
@@ -1812,11 +1942,12 @@ __fixup_amavisd() {
     #    "Can't connect to TCP port 10026 on 127.0.0.1 [Permission denied]".
     #    10024 already carries amavisd_recv_port_t.
     if command -v semanage >/dev/null 2>&1; then
-        local p
-        for p in 10026 10027; do
-            semanage port -a -t amavisd_recv_port_t -p tcp "$p" 2>/dev/null \
-                || semanage port -m -t amavisd_recv_port_t -p tcp "$p" 2>/dev/null || true
-        done
+        # 10026 is amavisd's own listener; 10027 is the Postfix reinjection port
+        # amavisd connects out to, which needs the send-port type.
+        semanage port -a -t amavisd_recv_port_t -p tcp 10026 >/dev/null 2>&1 \
+            || semanage port -m -t amavisd_recv_port_t -p tcp 10026 >/dev/null 2>&1 || true
+        semanage port -a -t amavisd_send_port_t -p tcp 10027 >/dev/null 2>&1 \
+            || semanage port -m -t amavisd_send_port_t -p tcp 10027 >/dev/null 2>&1 || true
         restorecon -R "$AMAVIS_CONF_DIR" 2>/dev/null || true
     fi
 
@@ -1873,6 +2004,11 @@ __fixup_amavisd() {
 
     # 4. The package ships disabled, so on a real reboot amavisd never comes up
     #    and Postfix's content_filter points at a dead port.
+    if systemctl list-unit-files 'clamd@amavisd.service' --no-legend 2>/dev/null | grep -q -- clamd; then
+        systemctl enable clamd@amavisd 2>/dev/null || true
+        systemctl reset-failed clamd@amavisd 2>/dev/null || true
+        systemctl restart clamd@amavisd 2>/dev/null || __warn "clamd@amavisd failed to start — check: journalctl -u clamd@amavisd"
+    fi
     systemctl enable "$AMAVIS_SERVICE" 2>/dev/null || true
     systemctl reset-failed "$AMAVIS_SERVICE" 2>/dev/null || true
     systemctl restart "$AMAVIS_SERVICE" 2>/dev/null \
@@ -1941,6 +2077,8 @@ __verify_services() {
     __amavis_detect
     if [[ -n "$AMAVIS_CONF_DIR" ]]; then
         systemctl is-active --quiet "$AMAVIS_SERVICE" || failed+=("$AMAVIS_SERVICE")
+    elif postconf -h content_filter 2>/dev/null | grep -q -- amavis; then
+        failed+=("amavisd-not-installed")
     fi
 
     # Every Postfix MySQL map must answer a lookup (exit 0 = hit, 1 = no match);
@@ -2316,6 +2454,7 @@ __main() {
     __generate_passwords
     __set_hostname
 
+    __step "Checking SELinux labels"           __selinux_relabel_etc
     __step "Updating system packages"          __update_system
     __step "Installing base packages"          __install_base_packages
     __step "Disabling existing Nginx"          __disable_nginx
@@ -2372,7 +2511,7 @@ __main() {
     __log "ISPConfig DB pass:  ${db_pass}"
     __warn "Credentials saved to: /root/ispconfig_installation_summary.txt"
     echo -e "${NC}"
-    rm -f "$STATE_FILE"
+    rm -f "$STATE_FILE" "$APT_NOPROMPT_CONF"
 }
 
 __main "$@"

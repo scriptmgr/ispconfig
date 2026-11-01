@@ -55,7 +55,7 @@ Passwords may not contain quotes, backslashes, backticks, dollar signs or whites
 ## ✨ Features
 
 - **🌍 Universal compatibility** — works across all major Linux distributions
-- **🐘 Multiple PHP versions** — installs PHP 7.4 through 8.5, whichever of those the distro's repositories actually offer — see [PHP version coverage](#-php-version-coverage)
+- **🐘 Multiple PHP versions** — installs PHP 7.4 through 8.5, whichever of those the distro's repositories actually offer, and registers each with ISPConfig so every website can pick its own — see [PHP version coverage](#-php-version-coverage)
 - **🌐 Apache direct hosting** — Apache serves website vhosts and terminates TLS on ports 80 and 443; the panel is available on a configurable HTTPS hostname
 - **🔧 Fully automated** — no interactive prompts; generates passwords by default and supports environment overrides
 - **🛡️ Security first** — HTTPS panel hostname, Apache default-host 404 page, internal ISPConfig panel listener, MariaDB bound to `127.0.0.1`, panel login failures banned by fail2ban using the real client IP, credentials written mode `0600`. **No firewall is configured** — see [Security Notes](#-security-notes)
