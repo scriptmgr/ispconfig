@@ -14,6 +14,9 @@ sysadmin's / ISPConfig's job, not a defect.
   after a reboot.
 - Not tested: a host that already runs MariaDB with an unknown root password.
   The installer should fail loudly there.
+- Re-verified after the Pure-FTPd change on AlmaLinux 9 and Debian 13 (PHP, FTP over
+  explicit TLS, mail round trips, spam/virus, reload). The test DNS zone had no NS
+  record, so the BIND answer check is a test-data gap, not verified.
 - Not tested: openSUSE, Fedora, CentOS/RHEL 7-8, Ubuntu 18/20, Debian 9-11,
   Rocky 8/10, AlmaLinux 8.
 - Not tested: ISPConfig's own Let's Encrypt (acme.sh) issuance, and
@@ -41,7 +44,3 @@ sysadmin's / ISPConfig's job, not a defect.
 - The installer's own temporary logs under `/tmp` trigger SELinux `load_policy`
   denials on RHEL-family when run from a systemd unit; silenced for the
   installer's `semanage`/`setsebool` calls.
-
-## Cleanup
-
-- Unused `SERVICE_MANAGER` variable in `install.sh` (shellcheck SC2034).

@@ -106,7 +106,7 @@ Apache serves ISPConfig-managed sites directly, including `.htaccess` rules and 
 | Database | MariaDB (secured, root password in `/root/.my.cnf`) |
 | PHP | Whatever the distro repos provide, up to 8.5, with FPM — see [PHP version coverage](#-php-version-coverage) |
 | Mail | Postfix + Dovecot + OpenDKIM (ports 25, 465, 587, 143, 993, 110, 995) |
-| FTP | ProFTPd with MySQL authentication |
+| FTP | Pure-FTPd with MySQL authentication and explicit TLS |
 | DNS | BIND9 / named, enabled and started at install |
 | Control panel | ISPConfig 3 (latest stable) |
 | Anti-spam | SpamAssassin + Amavisd-new |
@@ -191,7 +191,7 @@ The installer configures **no firewall** — allow inbound ports below if you se
 |---|---|---|
 | 80 | Apache HTTP | Public |
 | 443 | Apache HTTPS, including the ISPConfig panel hostname | Public |
-| 21 | ProFTPd | Public if FTP is used |
+| 21 | Pure-FTPd | Public if FTP is used (passive ports 40110-40210) |
 | 22 | SSH | Public — **keep this open or you will lock yourself out** |
 | 25, 465, 587 | Postfix SMTP / SMTPS / submission | Public if mail is used |
 | 110, 143, 993, 995 | Dovecot POP3 / IMAP / IMAPS / POP3S | Public if mail is used |
@@ -247,7 +247,7 @@ systemctl restart php84-php-fpm
 systemctl restart postfix dovecot opendkim
 
 # FTP
-systemctl restart proftpd
+systemctl restart pure-ftpd   # Debian/Ubuntu: pure-ftpd-mysql
 
 # MariaDB
 systemctl restart mariadb

@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202611011005-git
+##@Version           :  202611111300-git
 # @@Author           :  ISPConfig Universal Installer Contributors
 # @@Contact          :  https://github.com/scriptmgr/ispconfig
 # @@License          :  MIT
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202611011005-git"
+VERSION="202611111300-git"
 
 # Universal ISPConfig Installation Script
 # Architecture: Apache direct listeners on :80/:443; ISPConfig panel on configured hostname
@@ -61,7 +61,6 @@ HOSTNAME=""
 DISTRO=""
 DISTRO_VERSION=""
 PACKAGE_MANAGER=""
-SERVICE_MANAGER="systemctl"
 # fallback; overwritten after install to highest available version
 PHP_DEFAULT="8.3"
 PHP_VERSIONS=("8.5" "8.4" "8.3" "8.2" "8.1" "8.0" "7.4")
@@ -1111,40 +1110,95 @@ TRUSTEOF
 }
 
 # ── FTP ───────────────────────────────────────────────────────────────────────
+# ISPConfig 3.x only manages Pure-FTPd: its installer writes the MySQL account
+# map for Pure-FTPd and nothing else, so any other FTP daemon cannot log in the
+# accounts created in the panel.
+FTP_SERVICE=""
+__ftp_detect() {
+    local unit
+    FTP_SERVICE=""
+    for unit in pure-ftpd-mysql pure-ftpd; do
+        if systemctl list-unit-files "${unit}.service" --no-legend 2>/dev/null | grep -q .; then
+            FTP_SERVICE="$unit"
+            return 0
+        fi
+    done
+    return 1
+}
+
 __install_ftp() {
-    __log "Installing ProFTPd..."
+    __log "Installing Pure-FTPd..."
     case "$PACKAGE_MANAGER" in
         "apt")
-            # proftpd-mod-mysql is a separate package on some Debian versions but
-            # may be merged into proftpd or absent on others — treat it as optional
-            apt-get install -y proftpd-basic \
-                || apt-get install -y proftpd \
-                || __warn "proftpd install failed — FTP may not be available"
-            apt-get install -y proftpd-mod-mysql 2>/dev/null \
-                || __warn "proftpd-mod-mysql unavailable — MySQL-based FTP auth disabled"
+            apt-get install -y pure-ftpd-common pure-ftpd-mysql \
+                || __error "pure-ftpd-mysql install failed — FTP accounts would not work"
             ;;
         "dnf"|"yum")
-            # proftpd on EPEL 9 depends on libmemcached which is in CRB (CodeReady Builder).
-            # Enable CRB first, install the dep, then try proftpd normally;
-            # fall back to --nobest if strict dep resolution fails.
-            # CRB already enabled by __install_mail; re-enable idempotently in case
-            # install order changes.
-            dnf config-manager --set-enabled crb 2>/dev/null \
-                || dnf config-manager --set-enabled powertools 2>/dev/null \
-                || true
-            $PACKAGE_MANAGER install -y libmemcached-awesome 2>/dev/null \
-                || $PACKAGE_MANAGER install -y libmemcached 2>/dev/null || true
-            $PACKAGE_MANAGER install -y proftpd proftpd-mysql \
-                || $PACKAGE_MANAGER install -y --nobest proftpd proftpd-mysql \
-                || __warn "proftpd install failed — FTP may not be available"
+            $PACKAGE_MANAGER install -y pure-ftpd \
+                || __error "pure-ftpd install failed — FTP accounts would not work"
             ;;
         "zypper")
-            zypper install -y proftpd \
-                || __warn "proftpd install failed — FTP may not be available"
+            zypper install -y pure-ftpd \
+                || __error "pure-ftpd install failed — FTP accounts would not work"
             ;;
     esac
-    systemctl enable proftpd 2>/dev/null || true
-    systemctl start  proftpd 2>/dev/null || true
+    # ISPConfig writes its MySQL account map into db/ and the flag files into conf/
+    mkdir -p /etc/pure-ftpd/db /etc/pure-ftpd/conf
+    __ftp_detect || __error "Pure-FTPd installed but no pure-ftpd service unit found"
+    systemctl enable "$FTP_SERVICE" 2>/dev/null || true
+}
+
+# Runs after ISPConfig has written /etc/pure-ftpd/db/mysql.conf: point the
+# daemon at it, force chroot, and offer explicit TLS with the panel certificate.
+__configure_ftp() {
+    __ftp_detect || __error "No Pure-FTPd service found"
+    local myconf=/etc/pure-ftpd/db/mysql.conf
+    [[ "$PACKAGE_MANAGER" == "apt" ]] || myconf=/etc/pure-ftpd/pureftpd-mysql.conf
+    [[ -s "$myconf" ]] \
+        || __error "ISPConfig did not write ${myconf} — FTP accounts would not authenticate"
+    local pem
+    if [[ -d /etc/pure-ftpd/conf && "$PACKAGE_MANAGER" == "apt" ]]; then
+        pem=/etc/ssl/private/pure-ftpd.pem
+    else
+        pem=/etc/pure-ftpd/ispconfig.pem
+    fi
+    # Pure-FTPd wants key and certificate chain in one file.
+    mkdir -p "$(dirname "$pem")"
+    cat "$PANEL_KEY_FILE" "$PANEL_CERT_FILE" > "$pem"
+    chmod 600 "$pem"
+    cat > /etc/letsencrypt/renewal-hooks/deploy/98-ispconfig-ftp-cert <<HOOKEOF
+#!/bin/bash
+cat "${PANEL_KEY_FILE}" "${PANEL_CERT_FILE}" > "${pem}.new" \
+    && chmod 600 "${pem}.new" && mv -f "${pem}.new" "${pem}" \
+    && systemctl restart ${FTP_SERVICE}
+HOOKEOF
+    chmod 750 /etc/letsencrypt/renewal-hooks/deploy/98-ispconfig-ftp-cert
+
+    if [[ "$PACKAGE_MANAGER" == "apt" ]]; then
+        # Debian's wrapper builds the command line from one file per option
+        echo yes > /etc/pure-ftpd/conf/ChrootEveryone
+        echo yes > /etc/pure-ftpd/conf/BrokenClientsCompatibility
+        echo yes > /etc/pure-ftpd/conf/DontResolve
+        echo yes > /etc/pure-ftpd/conf/NoAnonymous
+        echo "40110 40210" > /etc/pure-ftpd/conf/PassivePortRange
+        echo 1 > /etc/pure-ftpd/conf/TLS
+    else
+        local conf=/etc/pure-ftpd/pure-ftpd.conf opt val
+        [[ -f "$conf" ]] || __error "Missing ${conf}"
+        local -A opts=(
+            [ChrootEveryone]="yes" [BrokenClientsCompatibility]="yes" [DontResolve]="yes"
+            [NoAnonymous]="yes" [DisplayDotFiles]="yes" [PAMAuthentication]="no"
+            [UnixAuthentication]="no" [MySQLConfigFile]="${myconf}"
+            [PassivePortRange]="40110 40210" [TLS]="1" [CertFile]="${pem}"
+        )
+        for opt in "${!opts[@]}"; do
+            val="${opts[$opt]}"
+            sed -i "/^[#[:space:]]*${opt}[[:space:]]/d" "$conf"
+            echo "${opt} ${val}" >> "$conf"
+        done
+    fi
+    systemctl restart "$FTP_SERVICE" || __error "${FTP_SERVICE} failed to start"
+    __success "Pure-FTPd configured: MySQL accounts, chroot, explicit TLS, passive ports 40110-40210"
 }
 
 # ── Additional tools ──────────────────────────────────────────────────────────
@@ -1251,12 +1305,11 @@ port     = smtp,465,587,imap,imaps,pop3,pop3s
 enabled  = true
 port     = imap,imaps,pop3,pop3s,sieve
 
-[proftpd]
+[pure-ftpd]
 enabled  = true
-port     = ftp,ftp-data,ftps,ftps-data
-# ProFTPd logs to a file; override the global systemd backend
-logpath  = /var/log/proftpd/proftpd.log
-backend  = auto
+port     = ftp,ftp-data,ftps,ftps-data,40110:40210
+backend  = systemd
+journalmatch = _SYSTEMD_UNIT=pure-ftpd.service + _SYSTEMD_UNIT=pure-ftpd-mysql.service
 
 [ispconfig-panel]
 enabled  = true
@@ -1278,8 +1331,6 @@ FILTER_EOF
     # even before the services have written anything.
     mkdir -p /var/log/ispconfig
     touch /var/log/ispconfig/auth.log
-    mkdir -p /var/log/proftpd
-    touch /var/log/proftpd/proftpd.log
 
     systemctl enable fail2ban
     systemctl restart fail2ban
@@ -1669,6 +1720,10 @@ __configure_selinux() {
     setsebool -P httpd_can_network_connect on >/dev/null 2>&1
     setsebool -P httpd_enable_homedirs on >/dev/null 2>&1 || true
 
+    # Pure-FTPd reads accounts from MySQL and writes into the web roots.
+    setsebool -P ftpd_connect_db on >/dev/null 2>&1 || true
+    setsebool -P ftpd_full_access on >/dev/null 2>&1 || true
+
     # ISPConfig's internal panel and apps listeners need the Apache port type.
     __selinux_label_ports "$APACHE_ADMIN_PORT" "$APACHE_APPS_PORT"
 
@@ -1951,6 +2006,18 @@ __fixup_amavisd() {
         restorecon -R "$AMAVIS_CONF_DIR" 2>/dev/null || true
     fi
 
+    # 3a. ISPConfig creates DKIM keys under /var/lib/amavis as root at runtime,
+    #     and they inherit var_lib_t, which amavisd (antivirus_t) cannot read —
+    #     amavisd then dies and all mail defers. Relabel on every (re)start.
+    if command -v restorecon >/dev/null 2>&1 && [[ -d /var/lib/amavis ]] \
+            && systemctl list-unit-files amavisd.service --no-legend 2>/dev/null | grep -q .; then
+        restorecon -R /var/lib/amavis 2>/dev/null || true
+        mkdir -p /etc/systemd/system/amavisd.service.d
+        printf '[Service]\nExecStartPre=-/usr/sbin/restorecon -R /var/lib/amavis\n' \
+            > /etc/systemd/system/amavisd.service.d/10-restorecon.conf
+        systemctl daemon-reload
+    fi
+
     # 3b. The amavis transport hands mail to amavisd over plain SMTP on
     #     127.0.0.1:10024. A global smtp_tls_wrappermode=yes (from a base config)
     #     would make Postfix attempt TLS on that port and defer all mail.
@@ -2050,7 +2117,7 @@ EOF
             ;;
     esac
 
-    systemctl restart postfix dovecot proftpd 2>/dev/null || true
+    systemctl restart postfix dovecot "${FTP_SERVICE:-pure-ftpd}" 2>/dev/null || true
     __fixup_amavisd
     apachectl configtest
 
@@ -2068,7 +2135,8 @@ EOF
 __verify_services() {
     local failed=() svc
 
-    for svc in "${APACHE_SERVICE}" postfix; do
+    __ftp_detect || failed+=("pure-ftpd-not-installed")
+    for svc in "${APACHE_SERVICE}" postfix ${FTP_SERVICE}; do
         systemctl is-active --quiet "$svc" || failed+=("$svc")
     done
 
@@ -2471,6 +2539,7 @@ __main() {
     __step "Configuring Apache backend"        __configure_apache_backend
     __step "Applying SELinux policy"           __configure_selinux
     __step "Configuring SSL"                   __configure_ssl
+    __step "Configuring FTP server"            __configure_ftp
     __step "Configuring Apache panel hostname" __configure_ispconfig_apache
     __step "Configuring public mail records"   __configure_mail_public
 
