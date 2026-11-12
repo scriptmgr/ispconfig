@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202611111300-git
+##@Version           :  202611121200-git
 # @@Author           :  ISPConfig Universal Installer Contributors
 # @@Contact          :  https://github.com/scriptmgr/ispconfig
 # @@License          :  MIT
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202611111300-git"
+VERSION="202611121200-git"
 
 # Universal ISPConfig Installation Script
 # Architecture: Apache direct listeners on :80/:443; ISPConfig panel on configured hostname
@@ -617,7 +617,9 @@ __bind_mariadb_loopback() {
     local confdir
     for confdir in /etc/my.cnf.d /etc/mysql/mariadb.conf.d; do
         [[ -d "$confdir" ]] || continue
-        printf '[mysqld]\nbind-address = 127.0.0.1\n' > "${confdir}/99-ispconfig-bind.cnf"
+        # Debian's 50-server.cnf sets expire_logs_days without enabling the
+        # binary log, which makes MariaDB warn on every start.
+        printf '[mysqld]\nbind-address = 127.0.0.1\nexpire_logs_days = 0\n' > "${confdir}/99-ispconfig-bind.cnf"
         return 0
     done
     __warn "No MariaDB config directory found — cannot restrict MariaDB to 127.0.0.1"
@@ -626,7 +628,14 @@ __bind_mariadb_loopback() {
 __install_mysql() {
     __log "Installing MariaDB server..."
     case "$PACKAGE_MANAGER" in
-        "apt")       apt-get install -y mariadb-server mariadb-client ;;
+        "apt")
+            # Seed the loopback/binlog override before the package's first
+            # start, so that start never warns or listens on every interface.
+            mkdir -p /etc/mysql/mariadb.conf.d
+            printf '[mysqld]\nbind-address = 127.0.0.1\nexpire_logs_days = 0\n' \
+                > /etc/mysql/mariadb.conf.d/99-ispconfig-bind.cnf
+            apt-get install -y mariadb-server mariadb-client
+            ;;
         "dnf"|"yum") $PACKAGE_MANAGER install -y mariadb-server mariadb ;;
         "zypper")    zypper install -y mariadb mariadb-client ;;
     esac
@@ -687,6 +696,17 @@ user=root
 password=${ISPCONFIG_MYSQL_ROOT_PASSWORD}
 EOF
     chmod 600 /root/.my.cnf
+
+    # Debian's mariadb start hook (debian-start) logs in over the unix socket
+    # with debian.cnf; once root has a password that fails on every restart.
+    if [[ -f /etc/mysql/debian.cnf ]]; then
+        local sect
+        for sect in client mysql_upgrade; do
+            sed -i "/^\[${sect}\]/,/^\[/{/^password[[:space:]]*=/d}" /etc/mysql/debian.cnf
+            sed -i "s/^\[${sect}\]\$/[${sect}]\npassword = ${ISPCONFIG_MYSQL_ROOT_PASSWORD}/" /etc/mysql/debian.cnf
+        done
+        chmod 600 /etc/mysql/debian.cnf
+    fi
     __success "MariaDB secured"
 }
 
@@ -1810,6 +1830,31 @@ __configure_selinux() {
         __log "Disabled OPcache for CGI (${_ini})"
     done
 
+    # 8. ISPConfig's vlogger (httpd_sys_script_t) chowns the vhost logs it
+    #    creates, and restorecon run from a service (setfiles_t) needs
+    #    dac_override; the stock policy denies both and logs an AVC each time.
+    if command -v checkmodule >/dev/null 2>&1 || __try_install "$PACKAGE_MANAGER" checkpolicy; then
+        local _semod
+        _semod=$(mktemp -d)
+        printf '%s\n' \
+            'module ispconfig_local 1.0;' \
+            'require {' \
+            '    type httpd_sys_script_t;' \
+            '    type setfiles_t;' \
+            '    class capability { chown dac_override };' \
+            '}' \
+            'allow httpd_sys_script_t self:capability chown;' \
+            'allow setfiles_t self:capability dac_override;' > "${_semod}/ispconfig_local.te"
+        if checkmodule -M -m -o "${_semod}/ispconfig_local.mod" "${_semod}/ispconfig_local.te" >/dev/null \
+                && semodule_package -o "${_semod}/ispconfig_local.pp" -m "${_semod}/ispconfig_local.mod" >/dev/null \
+                && semodule -i "${_semod}/ispconfig_local.pp"; then
+            __log "Loaded SELinux module ispconfig_local"
+        else
+            __warn "Could not build the ispconfig_local SELinux module — AVC denials will be logged"
+        fi
+        rm -rf "$_semod"
+    fi
+
     restorecon -R /usr/local/ispconfig /var/log/ispconfig /var/log/ispconfig/httpd /var/www/php-fcgi-scripts /var/lib/mailman /var/vmail "$LETSENCRYPT_WEBROOT" 2>/dev/null || true
 
     __success "SELinux policy applied (ports, booleans, file contexts)"
@@ -2015,6 +2060,21 @@ __fixup_amavisd() {
         mkdir -p /etc/systemd/system/amavisd.service.d
         printf '[Service]\nExecStartPre=-/usr/sbin/restorecon -R /var/lib/amavis\n' \
             > /etc/systemd/system/amavisd.service.d/10-restorecon.conf
+        systemctl daemon-reload
+    fi
+
+    # 3a2. Debian/Ubuntu: clamd needs a while to load its signature database
+    #      after boot, and amavis scanning before the socket exists logs
+    #      connection failures for every message. Order amavis after clamd and
+    #      wait (bounded) for the socket.
+    if [[ "$PACKAGE_MANAGER" == "apt" ]] \
+            && systemctl list-unit-files amavis.service --no-legend 2>/dev/null | grep -q -- amavis \
+            && systemctl list-unit-files clamav-daemon.service --no-legend 2>/dev/null | grep -q -- clamav; then
+        mkdir -p /etc/systemd/system/amavis.service.d
+        printf '%s\n' '[Unit]' 'After=clamav-daemon.service' 'Wants=clamav-daemon.service' \
+            '[Service]' 'TimeoutStartSec=300' \
+            "ExecStartPre=/bin/sh -c 'i=0; while [ \$i -lt 180 ] && [ ! -S /var/run/clamav/clamd.ctl ]; do i=\$((i+1)); sleep 1; done; exit 0'" \
+            > /etc/systemd/system/amavis.service.d/10-clamd-wait.conf
         systemctl daemon-reload
     fi
 
